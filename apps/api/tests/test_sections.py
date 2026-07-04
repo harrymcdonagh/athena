@@ -35,6 +35,34 @@ def test_extracts_all_three_sections_past_the_toc() -> None:
     assert "Unresolved Staff Comments" not in sections["risk_factors"].rstrip(" .")
 
 
+def test_extracts_sections_when_item_1b_is_omitted() -> None:
+    # Some companies omit "Item 1B. Unresolved Staff Comments" entirely; Item 1A
+    # runs directly into Item 2. Properties.
+    toc = (
+        "<p>Item 1. Business ... 3</p><p>Item 1A. Risk Factors ... 20</p>"
+        "<p>Item 2. Properties ... 40</p>"
+        "<p>Item 7. Management's Discussion and Analysis ... 50</p>"
+        "<p>Item 7A. Quantitative and Qualitative Disclosures ... 80</p>"
+    )
+    body = (
+        f"<h2>Item 1. Business</h2><p>{BUSINESS}</p>"
+        f"<h2>Item 1A. Risk Factors</h2><p>{RISKS}</p>"
+        "<h2>Item 2. Properties</h2><p>We lease office space.</p>"
+        f"<h2>Item 7. Management's Discussion and Analysis of Financial Condition</h2><p>{MDNA}</p>"
+        "<h2>Item 7A. Quantitative and Qualitative Disclosures About Market Risk</h2><p>Rates.</p>"
+    )
+    html = f"<html><body>{toc}{body}</body></html>"
+
+    sections = extract_sections(html)
+
+    assert set(sections) == {"business", "risk_factors", "mdna"}
+    assert "Revenue was $391,035 million" in sections["business"]
+    assert "Supply chain concentration" in sections["risk_factors"]
+    assert "services growth of 13%" in sections["mdna"]
+    # risk_factors must stop at Item 2 and not bleed into Properties
+    assert "lease office space" not in sections["risk_factors"]
+
+
 def test_missing_section_raises() -> None:
     with pytest.raises(SectionExtractionError):
         extract_sections("<html><body><p>Item 1. Business</p><p>short</p></body></html>")

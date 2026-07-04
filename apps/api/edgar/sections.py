@@ -13,7 +13,7 @@ _BOUNDS: dict[str, tuple[str, str]] = {
     ),
     "risk_factors": (
         r"item\s*1a\s*[.:–—-]?\s*risk\s*factors",
-        r"item\s*1b\s*[.:–—-]?\s*unresolved",
+        r"item\s*1b\s*[.:–—-]?\s*unresolved|item\s*2\s*[.:–—-]?\s*propert",
     ),
     "mdna": (
         r"item\s*7\s*[.:–—-]?\s*management",

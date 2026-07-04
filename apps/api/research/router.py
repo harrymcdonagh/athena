@@ -1,3 +1,4 @@
+from functools import lru_cache
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -19,6 +20,7 @@ from apps.api.research.summarizer import ClaudeSummarizer, SummarizationError
 router = APIRouter()
 
 
+@lru_cache
 def get_research_service() -> ResearchService:
     settings = get_settings()
     return ResearchService(
