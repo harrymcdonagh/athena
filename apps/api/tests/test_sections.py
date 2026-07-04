@@ -99,6 +99,53 @@ def test_extracts_sections_with_letter_split_headings() -> None:
     assert "Unresolved Staff Comments" not in sections["risk_factors"].rstrip(" .")
 
 
+def test_cross_references_are_not_treated_as_headings() -> None:
+    # Real 10-Ks contain cross-references deep in the notes, e.g.
+    # `Refer to "Item 1A. Risk Factors" ...` — these must not be mistaken
+    # for the actual heading (which would make the filter look for a
+    # section end that never comes after it) or for a section end (which
+    # would silently truncate an earlier section).
+    trailing = (
+        "<p>Refer to “Item 1A. Risk Factors” for additional information. "
+        "This discussion should be read in conjunction with "
+        "“Item 1A. Risk Factors,” our financial statements and the "
+        "related notes. " + ("Additional cross-reference context. " * 20) + "</p>"
+    )
+    assert len(trailing) > 600
+    html = build_10k_html().replace("</body></html>", trailing + "</body></html>")
+
+    sections = extract_sections(html)
+
+    assert set(sections) == {"business", "risk_factors", "mdna"}
+    assert sections["risk_factors"].startswith("Item 1A. Risk Factors")
+    assert "Competition may harm margins" in sections["risk_factors"]
+    assert "Additional cross-reference context" not in sections["business"]
+    assert "Additional cross-reference context" not in sections["risk_factors"]
+    assert "Additional cross-reference context" not in sections["mdna"]
+
+
+def test_cross_reference_filter_falls_back_when_all_matches_filtered() -> None:
+    # If every occurrence of a heading happens to be quoted (an unseen
+    # filing style), the filter would remove all candidates. The
+    # `filtered or positions` fallback must recover the genuine headings
+    # instead of raising.
+    body = (
+        f"<p>“Item 1. Business”</p><p>{BUSINESS}</p>"
+        f"<p>“Item 1A. Risk Factors”</p><p>{RISKS}</p>"
+        "<p>“Item 1B. Unresolved Staff Comments”</p><p>None.</p>"
+        f"<p>“Item 7. Management's Discussion and Analysis”</p><p>{MDNA}</p>"
+        "<p>“Item 7A. Quantitative and Qualitative Disclosures”</p><p>Rates.</p>"
+    )
+    html = f"<html><body>{body}</body></html>"
+
+    sections = extract_sections(html)
+
+    assert set(sections) == {"business", "risk_factors", "mdna"}
+    assert "Revenue was $391,035 million" in sections["business"]
+    assert "Supply chain concentration" in sections["risk_factors"]
+    assert "services growth of 13%" in sections["mdna"]
+
+
 def test_too_short_section_raises() -> None:
     html = (
         "<html><body><h2>Item 1. Business</h2><p>tiny</p>"

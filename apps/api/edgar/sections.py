@@ -26,6 +26,22 @@ class SectionExtractionError(Exception):
     pass
 
 
+_CROSS_REFERENCE_QUOTES = set("“”\"'’‘")
+_CROSS_REFERENCE_LEAD_INS = ("referto", "see", "seealso", "inconjunctionwith")
+
+
+def _is_cross_reference(squashed: str, pos: int) -> bool:
+    # Real headings are never quoted and are never preceded by phrases like
+    # "refer to" / "see" / "see also" / "in conjunction with" — but
+    # cross-references deep in the notes (e.g. `Refer to "Item 1A. Risk
+    # Factors" ...`) almost always are one or the other. Treat a match as a
+    # cross-reference, not a heading, when either signal is present.
+    if pos > 0 and squashed[pos - 1] in _CROSS_REFERENCE_QUOTES:
+        return True
+    preceding = squashed[max(0, pos - 30) : pos]
+    return preceding.endswith(_CROSS_REFERENCE_LEAD_INS)
+
+
 def extract_sections(html: str) -> dict[str, str]:
     text = _html_to_text(html)
     lowered = text.lower()
@@ -47,11 +63,13 @@ def extract_sections(html: str) -> dict[str, str]:
         starts = [m.start() for m in re.finditer(start_pattern, squashed)]
         if not starts:
             raise SectionExtractionError(f"could not locate the start of section {section!r}")
-        start = max(starts)  # last occurrence: TOC entries come first, the body last
+        filtered_starts = [p for p in starts if not _is_cross_reference(squashed, p)] or starts
+        start = max(filtered_starts)  # last occurrence: TOC entries come first, the body last
         ends = [m.start() for m in re.finditer(end_pattern, squashed) if m.start() > start]
         if not ends:
             raise SectionExtractionError(f"could not locate the end of section {section!r}")
-        end = min(ends)
+        filtered_ends = [p for p in ends if not _is_cross_reference(squashed, p)] or ends
+        end = min(filtered_ends)
         content = text[offsets[start] : offsets[end]].strip()
         if len(content) < _MIN_SECTION_CHARS:
             raise SectionExtractionError(
