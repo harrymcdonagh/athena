@@ -1,0 +1,14 @@
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: athena
+      POSTGRES_PASSWORD: athena
+      POSTGRES_DB: athena
+    ports:
+      - "5433:5432"
+    volumes:
+      - athena_pgdata:/var/lib/postgresql/data
+
+volumes:
+  athena_pgdata:

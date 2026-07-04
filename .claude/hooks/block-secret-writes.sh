@@ -9,7 +9,7 @@ file_path=$(echo "$input" | jq -r '.tool_input.file_path // empty')
 basename_only=$(basename "$file_path")
 rel="${file_path#"$(pwd)/"}"
 
-if [[ "$basename_only" == ".env" || "$basename_only" == .env.* ]]; then
+if [[ "$basename_only" == ".env" || ("$basename_only" == .env.* && "$basename_only" != ".env.example") ]]; then
   echo "BLOCKED: writes to .env / .env.* are not permitted." >&2
   exit 2
 fi
