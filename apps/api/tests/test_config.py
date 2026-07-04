@@ -15,5 +15,5 @@ def test_settings_read_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_settings_have_local_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("DATABASE_URL", raising=False)
-    settings = Settings(_env_file=None)
+    settings = Settings(_env_file=None)  # type: ignore[call-arg]
     assert settings.database_url.endswith("localhost:5433/athena")
