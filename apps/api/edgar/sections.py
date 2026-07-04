@@ -8,16 +8,16 @@ _MIN_SECTION_CHARS = 500
 
 _BOUNDS: dict[str, tuple[str, str]] = {
     "business": (
-        r"item\s*1\s*[.:–—-]?\s*business",
-        r"item\s*1a\s*[.:–—-]?\s*risk\s*factors",
+        r"item1[.:–—-]?business",
+        r"item1a[.:–—-]?riskfactors",
     ),
     "risk_factors": (
-        r"item\s*1a\s*[.:–—-]?\s*risk\s*factors",
-        r"item\s*1b\s*[.:–—-]?\s*unresolved|item\s*2\s*[.:–—-]?\s*propert",
+        r"item1a[.:–—-]?riskfactors",
+        r"item1b[.:–—-]?unresolved|item2[.:–—-]?propert",
     ),
     "mdna": (
-        r"item\s*7\s*[.:–—-]?\s*management",
-        r"item\s*7a\s*[.:–—-]?\s*quantitative",
+        r"item7[.:–—-]?management",
+        r"item7a[.:–—-]?quantitative",
     ),
 }
 
@@ -29,16 +29,30 @@ class SectionExtractionError(Exception):
 def extract_sections(html: str) -> dict[str, str]:
     text = _html_to_text(html)
     lowered = text.lower()
+
+    # Headings are sometimes styled with per-letter/small-caps spans, so
+    # get_text(" ") can yield spaces inside words (e.g. "b usiness"). Match
+    # against a whitespace-stripped shadow of the text, then map matched
+    # positions back to the original (naturally spaced) text for slicing.
+    squashed_chars: list[str] = []
+    offsets: list[int] = []
+    for i, ch in enumerate(lowered):
+        if not ch.isspace():
+            squashed_chars.append(ch)
+            offsets.append(i)
+    squashed = "".join(squashed_chars)
+
     sections: dict[str, str] = {}
     for section, (start_pattern, end_pattern) in _BOUNDS.items():
-        starts = [m.start() for m in re.finditer(start_pattern, lowered)]
+        starts = [m.start() for m in re.finditer(start_pattern, squashed)]
         if not starts:
             raise SectionExtractionError(f"could not locate the start of section {section!r}")
         start = max(starts)  # last occurrence: TOC entries come first, the body last
-        ends = [m.start() for m in re.finditer(end_pattern, lowered) if m.start() > start]
+        ends = [m.start() for m in re.finditer(end_pattern, squashed) if m.start() > start]
         if not ends:
             raise SectionExtractionError(f"could not locate the end of section {section!r}")
-        content = text[start : min(ends)].strip()
+        end = min(ends)
+        content = text[offsets[start] : offsets[end]].strip()
         if len(content) < _MIN_SECTION_CHARS:
             raise SectionExtractionError(
                 f"section {section!r} too short ({len(content)} chars) — extraction likely failed"
