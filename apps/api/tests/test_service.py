@@ -1,6 +1,8 @@
 from datetime import date
 
 import anthropic
+
+# anthropic SDK exception types are bound to real httpx; do not use httpx2 here.
 import httpx
 import pytest
 from sqlalchemy import Engine, text
