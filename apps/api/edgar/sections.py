@@ -39,7 +39,17 @@ def _is_cross_reference(squashed: str, pos: int) -> bool:
     if pos > 0 and squashed[pos - 1] in _CROSS_REFERENCE_QUOTES:
         return True
     preceding = squashed[max(0, pos - 30) : pos]
-    return preceding.endswith(_CROSS_REFERENCE_LEAD_INS)
+    for lead_in in _CROSS_REFERENCE_LEAD_INS:
+        if not preceding.endswith(lead_in):
+            continue
+        idx = pos - len(lead_in)
+        # Require a token boundary before the lead-in itself: without this,
+        # the bare "see" lead-in also matches word-internal endings like
+        # "licensee"/"oversee"/"lessee", which would misclassify a genuine
+        # heading as a cross-reference.
+        if idx <= 0 or not squashed[idx - 1].isalnum():
+            return True
+    return False
 
 
 def extract_sections(html: str) -> dict[str, str]:

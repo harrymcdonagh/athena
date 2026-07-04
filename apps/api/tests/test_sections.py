@@ -146,6 +146,73 @@ def test_cross_reference_filter_falls_back_when_all_matches_filtered() -> None:
     assert "services growth of 13%" in sections["mdna"]
 
 
+def test_word_ending_in_see_does_not_mask_real_heading() -> None:
+    # A body paragraph legitimately ends with a word like "licensee" right
+    # before the real Item 1A heading. The bare "see" lead-in must not match
+    # inside "licensee" (a token-boundary check is required) — otherwise the
+    # genuine heading is misclassified as a cross-reference and filtered
+    # out, leaving only the (unfiltered) TOC candidate to win.
+    business_body = BUSINESS + " We operate certain retail stores as the licensee"
+    toc = (
+        "<p>Item 1. Business ... 3</p><p>Item 1A. Risk Factors ... 20</p>"
+        "<p>Item 1B. Unresolved Staff Comments ... 45</p>"
+        "<p>Item 7. Management's Discussion and Analysis ... 50</p>"
+        "<p>Item 7A. Quantitative and Qualitative Disclosures ... 80</p>"
+    )
+    body = (
+        f"<h2>Item 1. Business</h2><p>{business_body}</p>"
+        f"<h2>Item 1A. Risk Factors</h2><p>{RISKS}</p>"
+        "<h2>Item 1B. Unresolved Staff Comments</h2><p>None.</p>"
+        "<h2>Item 5. Market</h2><p>Common stock is listed on Nasdaq.</p>"
+        f"<h2>Item 7. Management's Discussion and Analysis of Financial Condition</h2><p>{MDNA}</p>"
+        "<h2>Item 7A. Quantitative and Qualitative Disclosures About Market Risk</h2><p>Rates.</p>"
+    )
+    html = f"<html><body>{toc}{body}</body></html>"
+
+    sections = extract_sections(html)
+
+    assert sections["risk_factors"].startswith("Item 1A. Risk Factors")
+    assert "Competition may harm margins" in sections["risk_factors"]
+    # If "licensee" were mistaken for the "see" lead-in, the genuine heading
+    # would be dropped as a cross-reference and risk_factors would instead
+    # start at the earlier TOC line, bleeding the entire business section in.
+    assert "Revenue was $391,035 million" not in sections["risk_factors"]
+
+
+def test_mid_section_cross_reference_does_not_truncate_section() -> None:
+    # The NVDA bug: a cross-reference to the next section's heading can sit
+    # *inside* the current section's own body (not just in trailing notes).
+    # The nearest END match being a cross-reference must not truncate the
+    # section early — extraction must keep scanning to the real heading.
+    post_cross_ref = "Additional business detail after the cross-reference. " * 20
+    assert len(post_cross_ref) >= 600
+    business_body = (
+        BUSINESS + "Refer to “Item 1A. Risk Factors” for more information. " + post_cross_ref
+    )
+    toc = (
+        "<p>Item 1. Business ... 3</p><p>Item 1A. Risk Factors ... 20</p>"
+        "<p>Item 1B. Unresolved Staff Comments ... 45</p>"
+        "<p>Item 7. Management's Discussion and Analysis ... 50</p>"
+        "<p>Item 7A. Quantitative and Qualitative Disclosures ... 80</p>"
+    )
+    body = (
+        f"<h2>Item 1. Business</h2><p>{business_body}</p>"
+        f"<h2>Item 1A. Risk Factors</h2><p>{RISKS}</p>"
+        "<h2>Item 1B. Unresolved Staff Comments</h2><p>None.</p>"
+        "<h2>Item 5. Market</h2><p>Common stock is listed on Nasdaq.</p>"
+        f"<h2>Item 7. Management's Discussion and Analysis of Financial Condition</h2><p>{MDNA}</p>"
+        "<h2>Item 7A. Quantitative and Qualitative Disclosures About Market Risk</h2><p>Rates.</p>"
+    )
+    html = f"<html><body>{toc}{body}</body></html>"
+
+    sections = extract_sections(html)
+
+    assert "Revenue was $391,035 million" in sections["business"]
+    assert "Additional business detail after the cross-reference" in sections["business"]
+    assert sections["risk_factors"].startswith("Item 1A. Risk Factors")
+    assert "Competition may harm margins" in sections["risk_factors"]
+
+
 def test_too_short_section_raises() -> None:
     html = (
         "<html><body><h2>Item 1. Business</h2><p>tiny</p>"
