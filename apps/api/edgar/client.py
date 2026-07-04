@@ -39,6 +39,8 @@ class FilingRef:
 
 class EdgarClient:
     def __init__(self, user_agent: str, client: httpx.Client | None = None) -> None:
+        if client is None and not user_agent.strip():
+            raise ValueError("SEC_EDGAR_USER_AGENT must be set (SEC fair-access policy)")
         self._http = client or httpx.Client(
             headers={"User-Agent": user_agent}, timeout=30.0, follow_redirects=True
         )
@@ -46,32 +48,41 @@ class EdgarClient:
     def resolve_ticker(self, ticker: str) -> CompanyRef:
         data = self._get_json(COMPANY_TICKERS_URL)
         wanted = ticker.upper()
-        for entry in data.values():
-            if entry["ticker"].upper() == wanted:
-                return CompanyRef(
-                    ticker=entry["ticker"], cik=f"{entry['cik_str']:010d}", name=entry["title"]
-                )
+        try:
+            for entry in data.values():
+                if entry["ticker"].upper() == wanted:
+                    return CompanyRef(
+                        ticker=entry["ticker"],
+                        cik=f"{entry['cik_str']:010d}",
+                        name=entry["title"],
+                    )
+        except KeyError as exc:
+            raise EdgarError(f"unexpected EDGAR response shape: missing {exc}") from exc
         raise TickerNotFoundError(f"ticker {ticker!r} not found on SEC EDGAR")
 
     def latest_10k(self, company: CompanyRef) -> FilingRef:
         data = self._get_json(SUBMISSIONS_URL.format(cik=company.cik))
-        recent = data["filings"]["recent"]
-        for i, form in enumerate(recent["form"]):
-            if form != "10-K":
-                continue
-            accession = recent["accessionNumber"][i]
-            report_date = recent["reportDate"][i]
-            return FilingRef(
-                accession_number=accession,
-                form_type=form,
-                filing_date=date.fromisoformat(recent["filingDate"][i]),
-                period_end_date=date.fromisoformat(report_date) if report_date else None,
-                filing_url=ARCHIVES_URL.format(
-                    cik_int=int(company.cik),
-                    accession_nodash=accession.replace("-", ""),
-                    document=recent["primaryDocument"][i],
-                ),
-            )
+        try:
+            recent = data["filings"]["recent"]
+            for i, form in enumerate(recent["form"]):
+                if form != "10-K":
+                    continue
+                accession = recent["accessionNumber"][i]
+                report_date = recent["reportDate"][i]
+                filing = FilingRef(
+                    accession_number=accession,
+                    form_type=form,
+                    filing_date=date.fromisoformat(recent["filingDate"][i]),
+                    period_end_date=date.fromisoformat(report_date) if report_date else None,
+                    filing_url=ARCHIVES_URL.format(
+                        cik_int=int(company.cik),
+                        accession_nodash=accession.replace("-", ""),
+                        document=recent["primaryDocument"][i],
+                    ),
+                )
+                return filing
+        except KeyError as exc:
+            raise EdgarError(f"unexpected EDGAR response shape: missing {exc}") from exc
         raise FilingNotFoundError(f"no 10-K filing found for CIK {company.cik}")
 
     def fetch_document(self, filing: FilingRef) -> str:

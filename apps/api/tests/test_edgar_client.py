@@ -7,6 +7,7 @@ import pytest
 from apps.api.edgar.client import (
     CompanyRef,
     EdgarClient,
+    EdgarError,
     FilingNotFoundError,
     TickerNotFoundError,
 )
@@ -98,6 +99,15 @@ def test_latest_10k_none_found_raises() -> None:
         client.latest_10k(CompanyRef(ticker="X", cik="0000000009", name="X"))
 
 
+def test_latest_10k_malformed_response_raises_edgar_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=json.dumps({"filings": {}}))
+
+    client = make_client(handler)
+    with pytest.raises(EdgarError):
+        client.latest_10k(CompanyRef(ticker="X", cik="0000000009", name="X"))
+
+
 def test_fetch_document_returns_html() -> None:
     client = make_client(edgar_handler)
     company = CompanyRef(ticker="AAPL", cik="0000320193", name="Apple Inc.")
@@ -115,6 +125,21 @@ def test_default_client_sets_user_agent() -> None:
     user_agent_str = "Athena test@example.com"
     client = EdgarClient(user_agent=user_agent_str)
     assert client._http.headers["User-Agent"] == user_agent_str
+
+
+def test_blank_user_agent_without_injected_client_raises() -> None:
+    """SEC fair-access policy: refuse to build a default client with no User-Agent."""
+    with pytest.raises(ValueError, match="SEC_EDGAR_USER_AGENT"):
+        EdgarClient(user_agent="  ")
+
+
+def test_blank_user_agent_with_injected_client_is_unaffected() -> None:
+    """An injected client bypasses the default-client construction, so it is not validated."""
+    http = httpx.Client(transport=httpx.MockTransport(edgar_handler))
+    client = EdgarClient(user_agent="  ", client=http)
+    assert client.resolve_ticker("AAPL") == CompanyRef(
+        ticker="AAPL", cik="0000320193", name="Apple Inc."
+    )
 
 
 def test_requests_carry_user_agent_header() -> None:
