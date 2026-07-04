@@ -1,5 +1,7 @@
 from datetime import date
 
+import anthropic
+import httpx
 import pytest
 from sqlalchemy import Engine, text
 
@@ -61,6 +63,12 @@ class ExplodingSummarizer(FakeSummarizer):
         raise UpstreamError("anthropic", "boom")
 
 
+class AnthropicErrorSummarizer(FakeSummarizer):
+    def summarize(self, section: str, text: str, source_url: str) -> str:
+        request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+        raise anthropic.APIConnectionError(request=request)
+
+
 def count(db: Engine, table: str) -> int:
     with db.connect() as conn:
         result: int = conn.execute(text(f"SELECT count(*) FROM {table}")).scalar_one()
@@ -99,6 +107,17 @@ def test_summarizer_failure_persists_nothing(db: Engine) -> None:
     service = ResearchService(edgar=FakeEdgar(), summarizer=ExplodingSummarizer(), engine=db)
     with pytest.raises(UpstreamError):
         service.run("AAPL")
+    assert count(db, "companies") == 0
+    assert count(db, "filings") == 0
+    assert count(db, "filing_summaries") == 0
+    assert count(db, "thesis_snapshots") == 0
+
+
+def test_anthropic_error_is_wrapped_as_upstream_error(db: Engine) -> None:
+    service = ResearchService(edgar=FakeEdgar(), summarizer=AnthropicErrorSummarizer(), engine=db)
+    with pytest.raises(UpstreamError) as exc:
+        service.run("AAPL")
+    assert exc.value.source == "anthropic"
     assert count(db, "companies") == 0
     assert count(db, "filings") == 0
     assert count(db, "filing_summaries") == 0
