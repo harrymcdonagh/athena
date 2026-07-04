@@ -103,3 +103,31 @@ def test_fetch_document_returns_html() -> None:
     company = CompanyRef(ticker="AAPL", cik="0000320193", name="Apple Inc.")
     filing = client.latest_10k(company)
     assert client.fetch_document(filing) == "<html>10-K body</html>"
+
+
+def test_default_client_sets_user_agent() -> None:
+    """Verify User-Agent header is set on default httpx client.
+
+    Guards the SEC fair-access requirement that every EDGAR request
+    must carry a User-Agent header. Accessing _http is acceptable here
+    to verify this invariant is maintained.
+    """
+    user_agent_str = "Athena test@example.com"
+    client = EdgarClient(user_agent=user_agent_str)
+    assert client._http.headers["User-Agent"] == user_agent_str
+
+
+def test_requests_carry_user_agent_header() -> None:
+    """Verify User-Agent header is transmitted in actual requests."""
+    captured_headers: list[str | None] = []
+
+    def header_capturing_handler(request: httpx.Request) -> httpx.Response:
+        captured_headers.append(request.headers.get("User-Agent"))
+        # Return a valid response for company_tickers.json request
+        return httpx.Response(200, text=json.dumps(TICKERS))
+
+    client = make_client(header_capturing_handler)
+    client.resolve_ticker("AAPL")
+
+    assert len(captured_headers) == 1
+    assert captured_headers[0] == "t t@e.c"
