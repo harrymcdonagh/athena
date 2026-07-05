@@ -360,6 +360,26 @@ def test_qa_verification_warnings_survive_to_http_response(
     assert "C99" in body["warnings"][0]["message"]
 
 
+def test_qa_reasoning_artifact_warning_survives_to_http_response(
+    qa_client: TestClient, db: Engine
+) -> None:
+    seed_search_corpus(db)
+    leaky = QaAnswer(
+        mode="direct",
+        claims=[Claim(text="Revenue grew, led by services.", chunk_ids=["C1"])],
+        explanation="Scope is limited.<br>No change needed.",
+    )
+    use_answerer(FakeQaAnswerer(leaky))
+
+    response = qa_client.post("/research/qa", json={"question": "what drives revenue?"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert {w["kind"] for w in body["warnings"]} == {"reasoning_artifact"}
+    # Flagged, not stripped: the leaky text crosses the boundary intact.
+    assert body["answer"]["explanation"] == "Scope is limited.<br>No change needed."
+
+
 def test_qa_blank_question_returns_422(qa_client: TestClient) -> None:
     use_answerer(FakeQaAnswerer(DIRECT))
     response = qa_client.post("/research/qa", json={"question": "   "})

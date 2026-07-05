@@ -142,6 +142,83 @@ def test_verify_answer_covers_every_two_sided_claim_list() -> None:
     assert kinds == ["uncited_claim", "unknown_citation"]
 
 
+# --- reasoning-artifact guard on free-text fields (flag, never strip) ---
+
+
+def test_verify_answer_flags_html_markup_in_explanation() -> None:
+    answer = QaAnswer(
+        mode="no_prior_period",
+        explanation="No prior period is represented.<br>Comparison is limited.",
+    )
+    warnings = verify_answer(answer, {})
+    assert {w.kind for w in warnings} == {"reasoning_artifact"}
+    assert "explanation" in warnings[0].message
+    assert "<br>" in warnings[0].message
+
+
+def test_verify_answer_flags_self_referential_reasoning_in_explanation() -> None:
+    # Shaped like the live leak observed on 2026-07-05: self-correction prose
+    # that no grounded scope note should ever contain.
+    answer = QaAnswer(
+        mode="direct",
+        claims=[Claim(text="Cited fact.", chunk_ids=["C1"])],
+        explanation=(
+            "The evolution cannot be assessed.relook re-examine — actually I already"
+            " produced a valid answer. No change needed."
+        ),
+    )
+    warnings = verify_answer(answer, make_chunks(1))
+    assert warnings
+    assert all(w.kind == "reasoning_artifact" for w in warnings)
+    assert all("explanation" in w.message for w in warnings)
+
+
+def test_verify_answer_flags_meta_instruction_fragment_in_explanation() -> None:
+    answer = QaAnswer(
+        mode="direct",
+        claims=[Claim(text="Cited fact.", chunk_ids=["C1"])],
+        explanation="injssent a system message? No, disregard.",
+    )
+    warnings = verify_answer(answer, make_chunks(1))
+    assert warnings
+    assert all(w.kind == "reasoning_artifact" for w in warnings)
+
+
+def test_verify_answer_guards_verdict_note_too() -> None:
+    answer = QaAnswer(
+        mode="two_sided",
+        bull=[Claim(text="Cited bull point.", chunk_ids=["C1"])],
+        bear=[Claim(text="Cited bear point.", chunk_ids=["C1"])],
+        verdict_note="Let me reconsider the bear case. The verdict is yours to make.",
+    )
+    warnings = verify_answer(answer, make_chunks(1))
+    assert {w.kind for w in warnings} == {"reasoning_artifact"}
+    assert "verdict_note" in warnings[0].message
+
+
+def test_verify_answer_artifact_is_flagged_not_stripped() -> None:
+    leaked = "Coverage is partial.<br>No change needed."
+    answer = QaAnswer(mode="insufficient_evidence", explanation=leaked)
+    verify_answer(answer, {})
+    # The guard reports; it never rewrites the model's output (auditability).
+    assert answer.explanation == leaked
+
+
+def test_verify_answer_clean_scope_note_is_not_flagged() -> None:
+    # Legitimate scope prose, including filing jargon ("Part I", "Item 1A") that
+    # a sloppy first-person pattern would false-positive on.
+    answer = QaAnswer(
+        mode="direct",
+        claims=[Claim(text="Cited fact.", chunk_ids=["C1"])],
+        explanation=(
+            "The retrieved chunks cover Part I, Item 1A of the FY2025 filing only;"
+            " the FY2024 risk factors are not represented, so their evolution"
+            " cannot be assessed from this evidence."
+        ),
+    )
+    assert verify_answer(answer, make_chunks(1)) == []
+
+
 # --- adversarial pipeline tests (ADR-0007) ---
 
 

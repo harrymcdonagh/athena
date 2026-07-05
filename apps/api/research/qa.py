@@ -7,6 +7,7 @@ ADR's final consequence — review changes against the ADR, not as copy tweaks.
 """
 
 import argparse
+import re
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
@@ -94,13 +95,43 @@ class QaAnswer(BaseModel):
     bear: list[Claim] = Field(default_factory=list)
     what_changed: list[Claim] = Field(default_factory=list)
     verdict_note: str = ""  # two_sided: explicit verdict-is-the-user's statement
-    explanation: str = ""  # insufficient_evidence / no_prior_period
+    explanation: str = Field(
+        default="",
+        description=(
+            "Brief plain-text note (1-3 sentences) on what the retrieved chunks do"
+            " and do not cover — retrieval scope and limits only. Used mainly for"
+            " insufficient_evidence and no_prior_period modes. Never include your"
+            " reasoning process, drafting notes, or self-corrections, and never"
+            " HTML or markup."
+        ),
+    )
 
 
 @dataclass(frozen=True)
 class QaWarning:
-    kind: Literal["uncited_claim", "unknown_citation"]
+    kind: Literal["uncited_claim", "unknown_citation", "reasoning_artifact"]
     message: str
+
+
+# Leak classes for the free-text guard in verify_answer. Athena's own meta-prose
+# (explanation, verdict_note) should never contain markup, first-person process
+# talk, or self-correction fragments — their presence means model reasoning
+# leaked into user-facing output. Extend the list as new leak shapes appear;
+# detection flags a warning, it never rewrites the text.
+_ARTIFACT_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # HTML/markup (e.g. a stray <br>)
+    re.compile(r"</?[a-zA-Z][^>\n]*>"),
+    # first-person process talk ("I already produced...", "let me re-check")
+    re.compile(
+        r"(?i)\b(?:let me|i'(?:ll|ve|m)"
+        r"|i\s+(?:already|will|need|should|apologize|made|produced|answered|am))\b"
+    ),
+    # self-correction / meta-instruction fragments addressed to no reader
+    re.compile(
+        r"(?i)\b(?:no change needed|re-?examine|relook|on second thought|disregard"
+        r"|as an ai|system (?:message|prompt)|my previous (?:answer|response))\b"
+    ),
+)
 
 
 @dataclass(frozen=True)
@@ -151,10 +182,29 @@ def verify_answer(answer: QaAnswer, retrieved: dict[str, ChunkMatch]) -> list[Qa
     """Lightweight verification (ADR-0007 lightweight enforcement).
 
     Checks that every claim is CITED and that every citation points at a chunk
-    that was actually retrieved. It does NOT check that the cited chunk supports
-    the claim — that semantic check is future work per ADR-0007's Consequences.
+    that was actually retrieved, and that the free-text fields (explanation,
+    verdict_note) carry no leaked-reasoning artifacts. It does NOT check that
+    the cited chunk supports the claim — that semantic check is future work per
+    ADR-0007's Consequences. Findings are flagged as warnings; the answer text
+    is never altered.
     """
     warnings: list[QaWarning] = []
+    for field_name, value in (
+        ("explanation", answer.explanation),
+        ("verdict_note", answer.verdict_note),
+    ):
+        for pattern in _ARTIFACT_PATTERNS:
+            found = pattern.search(value)
+            if found:
+                warnings.append(
+                    QaWarning(
+                        kind="reasoning_artifact",
+                        message=(
+                            f"{field_name} contains a suspected leaked-reasoning"
+                            f" artifact: {found.group(0)!r}"
+                        ),
+                    )
+                )
     for claim in _all_claims(answer):
         if not claim.chunk_ids:
             warnings.append(

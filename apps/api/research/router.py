@@ -106,7 +106,7 @@ class QaRequest(BaseModel):
 
 
 class QaWarningResponse(BaseModel):
-    kind: Literal["uncited_claim", "unknown_citation"]
+    kind: Literal["uncited_claim", "unknown_citation", "reasoning_artifact"]
     message: str
 
 
