@@ -114,13 +114,21 @@ def run_backfill(engine: Engine, embedder: Embedder) -> int:
 
 
 def semantic_search(
-    engine: Engine, embedder: Embedder, query: str, limit: int = 8
+    engine: Engine,
+    embedder: Embedder,
+    query: str,
+    limit: int = 8,
+    *,
+    ticker: str | None = None,
+    section: str | None = None,
 ) -> list[ChunkMatch]:
     if not query.strip():
         raise ValueError("query must not be blank")
     query_embedding = embedder.embed_query(query)
     with engine.connect() as conn:
-        return Repository(conn).search_chunks(query_embedding, model=embedder.model, limit=limit)
+        return Repository(conn).search_chunks(
+            query_embedding, model=embedder.model, limit=limit, ticker=ticker, section=section
+        )
 
 
 def main() -> None:

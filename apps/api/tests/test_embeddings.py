@@ -136,14 +136,21 @@ def test_voyage_embedder_satisfies_protocol() -> None:
 # --- Repository.replace_chunks (real test database) ---
 
 
-def seed_filing(db: Engine, accession: str = "0000320193-25-000001") -> int:
+def seed_filing(
+    db: Engine,
+    accession: str = "0000320193-25-000001",
+    ticker: str = "AAPL",
+    cik: str = "0000320193",
+    name: str = "Apple Inc.",
+) -> int:
     with db.begin() as conn:
         company_id = conn.execute(
             text(
                 "INSERT INTO companies (ticker, cik, name)"
-                " VALUES ('AAPL', '0000320193', 'Apple Inc.')"
+                " VALUES (:ticker, :cik, :name)"
                 " ON CONFLICT (cik) DO UPDATE SET name = EXCLUDED.name RETURNING id"
-            )
+            ),
+            {"ticker": ticker, "cik": cik, "name": name},
         ).scalar_one()
         filing_id: int = conn.execute(
             text(
@@ -343,9 +350,13 @@ def test_search_chunks_orders_by_cosine_distance(db: Engine) -> None:
     seed_axis_chunks(db, filing_id)
     with db.connect() as conn:
         matches = Repository(conn).search_chunks(axis_vector(1), model="voyage-context-4", limit=3)
-    assert [m.content for m in matches] == ["topic 1", "topic 0", "topic 2"]
+    # topic 0 and topic 2 are both orthogonal to the query (distance exactly 1.0),
+    # so their relative order is a tie the SQL does not promise to break stably.
+    assert matches[0].content == "topic 1"
+    assert {m.content for m in matches[1:]} == {"topic 0", "topic 2"}
     assert matches[0].distance == pytest.approx(0.0, abs=1e-6)
     assert matches[1].distance == pytest.approx(1.0, abs=1e-6)
+    assert matches[2].distance == pytest.approx(1.0, abs=1e-6)
 
 
 def test_search_chunks_returns_full_provenance(db: Engine) -> None:
@@ -415,3 +426,56 @@ def test_semantic_search_embeds_query_and_returns_nearest_chunks(db: Engine) -> 
 def test_semantic_search_rejects_blank_query(db: Engine) -> None:
     with pytest.raises(ValueError, match="query"):
         semantic_search(db, FakeEmbedder(), "   ")
+
+
+# --- ticker/section filters (real test database) ---
+
+
+def seed_second_company_filing(db: Engine) -> int:
+    return seed_filing(
+        db,
+        accession="0000789019-25-000001",
+        ticker="MSFT",
+        cik="0000789019",
+        name="Microsoft Corporation",
+    )
+
+
+def test_search_chunks_filters_by_ticker_case_insensitively(db: Engine) -> None:
+    aapl_filing = seed_filing(db)
+    msft_filing = seed_second_company_filing(db)
+    seed_axis_chunks(db, aapl_filing)
+    seed_axis_chunks(db, msft_filing)
+    with db.connect() as conn:
+        matches = Repository(conn).search_chunks(
+            axis_vector(1), model="voyage-context-4", limit=10, ticker="msft"
+        )
+    assert len(matches) == 3
+    assert all(m.ticker == "MSFT" for m in matches)
+
+
+def test_search_chunks_filters_by_section(db: Engine) -> None:
+    filing_id = seed_filing(db)
+    seed_axis_chunks(db, filing_id, section="mdna")
+    seed_axis_chunks(db, filing_id, section="business")
+    with db.connect() as conn:
+        matches = Repository(conn).search_chunks(
+            axis_vector(1), model="voyage-context-4", limit=10, section="business"
+        )
+    assert len(matches) == 3
+    assert all(m.section == "business" for m in matches)
+
+
+def test_semantic_search_passes_filters_through(db: Engine) -> None:
+    aapl_filing = seed_filing(db)
+    msft_filing = seed_second_company_filing(db)
+    seed_axis_chunks(db, aapl_filing, section="mdna")
+    seed_axis_chunks(db, aapl_filing, section="business")
+    seed_axis_chunks(db, msft_filing, section="mdna")
+
+    matches = semantic_search(
+        db, QueryOnlyEmbedder(axis_vector(0)), "growth", ticker="AAPL", section="mdna"
+    )
+
+    assert len(matches) == 3
+    assert all(m.ticker == "AAPL" and m.section == "mdna" for m in matches)

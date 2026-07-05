@@ -187,7 +187,21 @@ class Repository:
         *,
         model: str,
         limit: int = 8,
+        ticker: str | None = None,
+        section: str | None = None,
     ) -> list[ChunkMatch]:
+        filters = ""
+        params: dict[str, object] = {
+            "query": _vector_literal(query_embedding),
+            "model": model,
+            "limit": limit,
+        }
+        if ticker is not None:
+            filters += " AND upper(co.ticker) = upper(:ticker)"
+            params["ticker"] = ticker
+        if section is not None:
+            filters += " AND fc.section = :section"
+            params["section"] = section
         rows = self._conn.execute(
             text(
                 "SELECT co.ticker, fc.filing_id, fc.section, fc.chunk_index, fc.content,"
@@ -196,10 +210,11 @@ class Repository:
                 " JOIN filings f ON f.id = fc.filing_id"
                 " JOIN companies co ON co.id = f.company_id"
                 " WHERE fc.model = :model"
-                " ORDER BY fc.embedding <=> CAST(:query AS vector)"
+                + filters
+                + " ORDER BY fc.embedding <=> CAST(:query AS vector)"
                 " LIMIT :limit"
             ),
-            {"query": _vector_literal(query_embedding), "model": model, "limit": limit},
+            params,
         ).all()
         return [
             ChunkMatch(
