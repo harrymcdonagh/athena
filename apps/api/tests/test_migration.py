@@ -30,8 +30,9 @@ def _seed_snapshot(conn: Connection) -> None:
     filing_id = conn.execute(
         text(
             "INSERT INTO filings (company_id, accession_number, form_type, filing_date,"
-            " filing_url, content_sha256)"
-            " VALUES (:c, 'acc-1', '10-K', '2026-01-01', 'https://example.com', 'sha') RETURNING id"
+            " period_end_date, filing_url, content_sha256)"
+            " VALUES (:c, 'acc-1', '10-K', '2026-01-01', '2025-12-31', 'https://example.com',"
+            " 'sha') RETURNING id"
         ),
         {"c": company_id},
     ).scalar_one()

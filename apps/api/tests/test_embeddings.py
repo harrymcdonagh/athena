@@ -155,8 +155,8 @@ def seed_filing(
         filing_id: int = conn.execute(
             text(
                 "INSERT INTO filings (company_id, accession_number, form_type, filing_date,"
-                " filing_url, content_sha256)"
-                " VALUES (:company_id, :acc, '10-K', '2025-10-31',"
+                " period_end_date, filing_url, content_sha256)"
+                " VALUES (:company_id, :acc, '10-K', '2025-10-31', '2025-09-27',"
                 " 'https://sec.gov/filing.htm', 'abc123') RETURNING id"
             ),
             {"company_id": company_id, "acc": accession},
