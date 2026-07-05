@@ -27,6 +27,21 @@ class PendingSection:
 
 
 @dataclass(frozen=True)
+class ChunkMatch:
+    ticker: str
+    filing_id: int
+    section: str
+    chunk_index: int
+    content: str
+    source_url: str
+    distance: float
+
+
+def _vector_literal(embedding: Sequence[float]) -> str:
+    return "[" + ",".join(map(str, embedding)) + "]"
+
+
+@dataclass(frozen=True)
 class ResearchView:
     ticker: str
     company_name: str
@@ -159,12 +174,45 @@ class Repository:
                     "source_url": source_url,
                     "chunk_index": index,
                     "content": chunk.text,
-                    "embedding": "[" + ",".join(map(str, chunk.embedding)) + "]",
+                    "embedding": _vector_literal(chunk.embedding),
                     "model": model,
                     "dimension": dimension,
                 },
             )
         return len(chunks)
+
+    def search_chunks(
+        self,
+        query_embedding: Sequence[float],
+        *,
+        model: str,
+        limit: int = 8,
+    ) -> list[ChunkMatch]:
+        rows = self._conn.execute(
+            text(
+                "SELECT co.ticker, fc.filing_id, fc.section, fc.chunk_index, fc.content,"
+                " fc.source_url, fc.embedding <=> CAST(:query AS vector) AS distance"
+                " FROM filing_chunks fc"
+                " JOIN filings f ON f.id = fc.filing_id"
+                " JOIN companies co ON co.id = f.company_id"
+                " WHERE fc.model = :model"
+                " ORDER BY fc.embedding <=> CAST(:query AS vector)"
+                " LIMIT :limit"
+            ),
+            {"query": _vector_literal(query_embedding), "model": model, "limit": limit},
+        ).all()
+        return [
+            ChunkMatch(
+                ticker=row.ticker,
+                filing_id=row.filing_id,
+                section=row.section,
+                chunk_index=row.chunk_index,
+                content=row.content,
+                source_url=row.source_url,
+                distance=row.distance,
+            )
+            for row in rows
+        ]
 
     def insert_thesis_snapshot(self, company_id: int, filing_id: int, content: str) -> int:
         result: int = self._conn.execute(

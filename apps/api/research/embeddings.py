@@ -6,7 +6,7 @@ import voyageai
 from sqlalchemy import Engine, create_engine
 
 from apps.api.config import get_settings
-from apps.api.research.repository import Repository
+from apps.api.research.repository import ChunkMatch, Repository
 
 _MODEL = "voyage-context-4"
 _DIMENSION = 1024
@@ -111,6 +111,16 @@ def run_backfill(engine: Engine, embedder: Embedder) -> int:
                 dimension=embedder.dimension,
             )
     return len(pending)
+
+
+def semantic_search(
+    engine: Engine, embedder: Embedder, query: str, limit: int = 8
+) -> list[ChunkMatch]:
+    if not query.strip():
+        raise ValueError("query must not be blank")
+    query_embedding = embedder.embed_query(query)
+    with engine.connect() as conn:
+        return Repository(conn).search_chunks(query_embedding, model=embedder.model, limit=limit)
 
 
 def main() -> None:

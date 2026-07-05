@@ -11,6 +11,7 @@ from apps.api.research.embeddings import (
     EmbeddingError,
     VoyageEmbedder,
     run_backfill,
+    semantic_search,
 )
 from apps.api.research.repository import Repository
 
@@ -313,3 +314,104 @@ def test_run_backfill_reembeds_sections_tagged_with_a_different_model(db: Engine
         )
     assert models == ["voyage-context-5"]
     assert chunk_count(db) == 3
+
+
+# --- semantic search (real test database) ---
+
+
+def axis_vector(axis: int) -> list[float]:
+    vector = [0.0] * 1024
+    vector[axis] = 1.0
+    return vector
+
+
+def seed_axis_chunks(db: Engine, filing_id: int, section: str = "mdna") -> None:
+    chunks = [EmbeddedChunk(text=f"topic {axis}", embedding=axis_vector(axis)) for axis in range(3)]
+    with db.begin() as conn:
+        Repository(conn).replace_chunks(
+            filing_id,
+            section,
+            "https://sec.gov/filing.htm",
+            chunks,
+            model="voyage-context-4",
+            dimension=1024,
+        )
+
+
+def test_search_chunks_orders_by_cosine_distance(db: Engine) -> None:
+    filing_id = seed_filing(db)
+    seed_axis_chunks(db, filing_id)
+    with db.connect() as conn:
+        matches = Repository(conn).search_chunks(axis_vector(1), model="voyage-context-4", limit=3)
+    assert [m.content for m in matches] == ["topic 1", "topic 0", "topic 2"]
+    assert matches[0].distance == pytest.approx(0.0, abs=1e-6)
+    assert matches[1].distance == pytest.approx(1.0, abs=1e-6)
+
+
+def test_search_chunks_returns_full_provenance(db: Engine) -> None:
+    filing_id = seed_filing(db)
+    seed_axis_chunks(db, filing_id)
+    with db.connect() as conn:
+        match = Repository(conn).search_chunks(axis_vector(2), model="voyage-context-4", limit=1)[0]
+    assert match.ticker == "AAPL"
+    assert match.filing_id == filing_id
+    assert match.section == "mdna"
+    assert match.chunk_index == 2
+    assert match.content == "topic 2"
+    assert match.source_url == "https://sec.gov/filing.htm"
+
+
+def test_search_chunks_only_matches_chunks_from_the_given_model(db: Engine) -> None:
+    filing_id = seed_filing(db)
+    seed_axis_chunks(db, filing_id, section="mdna")
+    with db.begin() as conn:
+        Repository(conn).replace_chunks(
+            filing_id,
+            "business",
+            "https://sec.gov/filing.htm",
+            [EmbeddedChunk(text="stale model chunk", embedding=axis_vector(1))],
+            model="voyage-context-3",
+            dimension=1024,
+        )
+    with db.connect() as conn:
+        matches = Repository(conn).search_chunks(axis_vector(1), model="voyage-context-4", limit=10)
+    assert all(m.content != "stale model chunk" for m in matches)
+    assert len(matches) == 3
+
+
+def test_search_chunks_respects_limit(db: Engine) -> None:
+    filing_id = seed_filing(db)
+    seed_axis_chunks(db, filing_id)
+    with db.connect() as conn:
+        matches = Repository(conn).search_chunks(axis_vector(0), model="voyage-context-4", limit=2)
+    assert len(matches) == 2
+
+
+class QueryOnlyEmbedder(FakeEmbedder):
+    def __init__(self, query_vector: list[float]) -> None:
+        super().__init__()
+        self._query_vector = query_vector
+        self.queries: list[str] = []
+
+    def embed_query(self, text: str) -> list[float]:
+        self.queries.append(text)
+        return self._query_vector
+
+
+def test_semantic_search_embeds_query_and_returns_nearest_chunks(db: Engine) -> None:
+    filing_id = seed_filing(db)
+    seed_axis_chunks(db, filing_id)
+    embedder = QueryOnlyEmbedder(axis_vector(2))
+
+    matches = semantic_search(db, embedder, "what about topic two?", limit=2)
+
+    assert embedder.queries == ["what about topic two?"]
+    assert [m.content for m in matches] == ["topic 2", "topic 0"] or [
+        m.content for m in matches
+    ] == ["topic 2", "topic 1"]
+    assert matches[0].distance == pytest.approx(0.0, abs=1e-6)
+
+
+def test_semantic_search_rejects_blank_query(db: Engine) -> None:
+    with pytest.raises(ValueError, match="query"):
+        semantic_search(db, FakeEmbedder(), "   ")
