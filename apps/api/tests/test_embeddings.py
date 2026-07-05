@@ -142,6 +142,9 @@ def seed_filing(
     ticker: str = "AAPL",
     cik: str = "0000320193",
     name: str = "Apple Inc.",
+    filing_date: str = "2025-10-31",
+    period_end_date: str = "2025-09-27",
+    filing_url: str = "https://sec.gov/filing.htm",
 ) -> int:
     with db.begin() as conn:
         company_id = conn.execute(
@@ -156,10 +159,16 @@ def seed_filing(
             text(
                 "INSERT INTO filings (company_id, accession_number, form_type, filing_date,"
                 " period_end_date, filing_url, content_sha256)"
-                " VALUES (:company_id, :acc, '10-K', '2025-10-31', '2025-09-27',"
-                " 'https://sec.gov/filing.htm', 'abc123') RETURNING id"
+                " VALUES (:company_id, :acc, '10-K', :filed, :period, :url, 'abc123')"
+                " RETURNING id"
             ),
-            {"company_id": company_id, "acc": accession},
+            {
+                "company_id": company_id,
+                "acc": accession,
+                "filed": filing_date,
+                "period": period_end_date,
+                "url": filing_url,
+            },
         ).scalar_one()
     return filing_id
 
@@ -256,17 +265,26 @@ class FakeEmbedder:
         return [0.5] * 1024
 
 
-def seed_summaries(db: Engine, filing_id: int, sections: list[str]) -> None:
+def seed_summaries(
+    db: Engine,
+    filing_id: int,
+    sections: list[str],
+    source_url: str = "https://sec.gov/filing.htm",
+) -> None:
     with db.begin() as conn:
         for section in sections:
             conn.execute(
                 text(
                     "INSERT INTO filing_summaries"
                     " (filing_id, section, summary, source_text, source_url, model)"
-                    " VALUES (:f, :s, 'summary', :src, 'https://sec.gov/filing.htm',"
-                    " 'claude-sonnet-5')"
+                    " VALUES (:f, :s, 'summary', :src, :url, 'claude-sonnet-5')"
                 ),
-                {"f": filing_id, "s": section, "src": f"full {section} section text"},
+                {
+                    "f": filing_id,
+                    "s": section,
+                    "src": f"full {section} section text",
+                    "url": source_url,
+                },
             )
 
 
@@ -321,6 +339,80 @@ def test_run_backfill_reembeds_sections_tagged_with_a_different_model(db: Engine
         )
     assert models == ["voyage-context-5"]
     assert chunk_count(db) == 3
+
+
+def test_run_backfill_embeds_only_new_filing_sections(db: Engine) -> None:
+    """ADR-0008: adding a prior-year filing re-uses the existing backfill;
+    only the new filing's sections are pending, and its chunks carry its own
+    source_url. The already-embedded filing is untouched."""
+    newer = seed_filing(db)
+    seed_summaries(db, newer, ["business", "mdna"])
+    run_backfill(db, FakeEmbedder())
+
+    prior = seed_filing(
+        db,
+        accession="0000320193-24-000100",
+        filing_date="2024-11-01",
+        period_end_date="2024-09-28",
+        filing_url="https://sec.gov/old-10k.htm",
+    )
+    seed_summaries(db, prior, ["business", "mdna"], source_url="https://sec.gov/old-10k.htm")
+    second = FakeEmbedder()
+    embedded = run_backfill(db, second)
+
+    assert embedded == 2
+    assert len(second.calls) == 2
+    with db.connect() as conn:
+        per_filing = {
+            row.filing_id: row.n
+            for row in conn.execute(
+                text("SELECT filing_id, count(*) AS n FROM filing_chunks GROUP BY filing_id")
+            )
+        }
+        prior_urls = (
+            conn.execute(
+                text("SELECT DISTINCT source_url FROM filing_chunks WHERE filing_id = :f"),
+                {"f": prior},
+            )
+            .scalars()
+            .all()
+        )
+    assert per_filing == {newer: 4, prior: 4}
+    assert prior_urls == ["https://sec.gov/old-10k.htm"]
+
+
+def test_chunks_from_two_filings_same_company_distinguishable_by_period(db: Engine) -> None:
+    """Temporal retrieval linkage (ADR-0008): every chunk resolves to its
+    filing's period_end_date through filing_chunks.filing_id -> filings, so
+    an AAPL FY2025 chunk and an AAPL FY2024 chunk are distinct evidence."""
+    newer = seed_filing(db)
+    prior = seed_filing(
+        db,
+        accession="0000320193-24-000100",
+        filing_date="2024-11-01",
+        period_end_date="2024-09-28",
+        filing_url="https://sec.gov/old-10k.htm",
+    )
+    seed_axis_chunks(db, newer)
+    seed_axis_chunks(db, prior)
+
+    with db.connect() as conn:
+        periods = {
+            row.filing_id: row.period_end_date
+            for row in conn.execute(
+                text(
+                    "SELECT DISTINCT fc.filing_id, f.period_end_date"
+                    " FROM filing_chunks fc JOIN filings f ON f.id = fc.filing_id"
+                )
+            )
+        }
+        matches = Repository(conn).search_chunks(
+            axis_vector(1), model="voyage-context-4", limit=10, ticker="AAPL"
+        )
+    assert periods[newer].isoformat() == "2025-09-27"
+    assert periods[prior].isoformat() == "2024-09-28"
+    # retrieval spans both periods, and each match's filing_id keys its period
+    assert {m.filing_id for m in matches} == {newer, prior}
 
 
 # --- semantic search (real test database) ---

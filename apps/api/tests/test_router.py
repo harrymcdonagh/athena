@@ -12,6 +12,7 @@ from apps.api.research.qa import Claim, QaAnswer, QaAnswerer
 from apps.api.research.repository import Repository
 from apps.api.research.router import (
     QaResponse,
+    ResearchResponse,
     get_embedder,
     get_qa_answerer,
     get_read_engine,
@@ -25,7 +26,7 @@ from apps.api.tests.test_embeddings import (
     seed_second_company_filing,
 )
 from apps.api.tests.test_qa import TWO_SIDED, AnthropicErrorAnswerer, FakeQaAnswerer
-from apps.api.tests.test_service import FakeEdgar, FakeSummarizer
+from apps.api.tests.test_service import EIGHT_K, FILING, PRIOR_FILING, FakeEdgar, FakeSummarizer
 
 
 class UnknownTickerEdgar(FakeEdgar):
@@ -47,16 +48,66 @@ def test_post_research_returns_summaries_and_ids(client: TestClient) -> None:
     assert response.status_code == 200
     body = response.json()
     assert body["ticker"] == "AAPL"
+    assert body["status"] == "ingested"
     assert body["accession_number"] == "0000320193-25-000123"
     assert set(body["summaries"]) == {"business", "risk_factors", "mdna"}
     assert body["filing_url"].startswith("https://www.sec.gov/")
 
 
-def test_post_research_twice_returns_409(client: TestClient) -> None:
+def test_post_research_twice_returns_200_skipped(client: TestClient) -> None:
+    first = client.post("/research/AAPL")
+    assert first.status_code == 200
+
+    second = client.post("/research/AAPL")
+
+    assert second.status_code == 200
+    body = second.json()
+    assert body["status"] == "skipped"
+    assert body["filing_id"] == first.json()["filing_id"]
+    assert body["summaries"] == {}
+    assert body["thesis_snapshot_id"] is None
+
+
+def test_post_research_with_accession_param_ingests_that_filing(
+    client: TestClient, db: Engine
+) -> None:
+    edgar = FakeEdgar(filings=[FILING, PRIOR_FILING])
+    service = ResearchService(edgar=edgar, summarizer=FakeSummarizer(), engine=db)
+    app.dependency_overrides[get_research_service] = lambda: service
+
     assert client.post("/research/AAPL").status_code == 200
-    response = client.post("/research/AAPL")
-    assert response.status_code == 409
-    assert "already ingested" in response.json()["detail"]
+    response = client.post(
+        "/research/AAPL", params={"accession_number": PRIOR_FILING.accession_number}
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "ingested"
+    assert body["accession_number"] == PRIOR_FILING.accession_number
+
+    # ADR-0008 §4: the backfilled prior year must not hijack "latest research".
+    summary = client.get("/companies/AAPL/summary")
+    assert summary.status_code == 200
+    assert summary.json()["accession_number"] == FILING.accession_number
+
+
+def test_post_research_unknown_accession_returns_404(client: TestClient) -> None:
+    response = client.post("/research/AAPL", params={"accession_number": "0000320193-99-999999"})
+    assert response.status_code == 404
+
+
+def test_post_research_non_10k_accession_returns_422(client: TestClient, db: Engine) -> None:
+    edgar = FakeEdgar(filings=[EIGHT_K, FILING])
+    service = ResearchService(edgar=edgar, summarizer=FakeSummarizer(), engine=db)
+    app.dependency_overrides[get_research_service] = lambda: service
+    response = client.post("/research/AAPL", params={"accession_number": EIGHT_K.accession_number})
+    assert response.status_code == 422
+    assert "8-K" in response.json()["detail"]
+
+
+def test_research_response_shape(client: TestClient) -> None:
+    body = client.post("/research/AAPL").json()
+    assert set(body) == set(ResearchResponse.model_fields)
 
 
 def test_post_research_unknown_ticker_returns_404(client: TestClient, db: Engine) -> None:

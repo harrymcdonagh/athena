@@ -61,29 +61,69 @@ class EdgarClient:
         raise TickerNotFoundError(f"ticker {ticker!r} not found on SEC EDGAR")
 
     def latest_10k(self, company: CompanyRef) -> FilingRef:
+        filings = self.list_filings(company, "10-K")
+        if not filings:
+            raise FilingNotFoundError(f"no 10-K filing found for CIK {company.cik}")
+        return filings[0]
+
+    def list_filings(self, company: CompanyRef, form_type: str) -> list[FilingRef]:
+        """All of a company's filings of the given form type, most recent first.
+
+        Only EDGAR's "recent" window (~1000 most recent filings) is scanned;
+        older filings live in paginated archive files and are out of scope for
+        now. Exact form match, so amendments (e.g. 10-K/A) are excluded.
+        """
+        recent = self._recent_filings(company)
+        try:
+            return [
+                self._filing_ref(company, recent, i)
+                for i, form in enumerate(recent["form"])
+                if form == form_type
+            ]
+        except (KeyError, IndexError, ValueError) as exc:
+            raise EdgarError(f"unexpected EDGAR response shape: {exc!r}") from exc
+
+    def get_filing(self, company: CompanyRef, accession_number: str) -> FilingRef:
+        """A specific filing by accession number, matched dash-insensitively.
+
+        Returns the canonical dashed accession number regardless of caller
+        formatting, so the database dedup key stays uniform. Same "recent"
+        window limitation as list_filings.
+        """
+        wanted = accession_number.strip().replace("-", "")
+        recent = self._recent_filings(company)
+        try:
+            for i, accession in enumerate(recent["accessionNumber"]):
+                if accession.replace("-", "") == wanted:
+                    return self._filing_ref(company, recent, i)
+        except (KeyError, IndexError, ValueError) as exc:
+            raise EdgarError(f"unexpected EDGAR response shape: {exc!r}") from exc
+        raise FilingNotFoundError(
+            f"accession {accession_number!r} not found in recent filings for CIK {company.cik}"
+        )
+
+    def _recent_filings(self, company: CompanyRef) -> dict[str, Any]:
         data = self._get_json(SUBMISSIONS_URL.format(cik=company.cik))
         try:
-            recent = data["filings"]["recent"]
-            for i, form in enumerate(recent["form"]):
-                if form != "10-K":
-                    continue
-                accession = recent["accessionNumber"][i]
-                report_date = recent["reportDate"][i]
-                filing = FilingRef(
-                    accession_number=accession,
-                    form_type=form,
-                    filing_date=date.fromisoformat(recent["filingDate"][i]),
-                    period_end_date=date.fromisoformat(report_date) if report_date else None,
-                    filing_url=ARCHIVES_URL.format(
-                        cik_int=int(company.cik),
-                        accession_nodash=accession.replace("-", ""),
-                        document=recent["primaryDocument"][i],
-                    ),
-                )
-                return filing
+            recent: dict[str, Any] = data["filings"]["recent"]
         except KeyError as exc:
             raise EdgarError(f"unexpected EDGAR response shape: missing {exc}") from exc
-        raise FilingNotFoundError(f"no 10-K filing found for CIK {company.cik}")
+        return recent
+
+    def _filing_ref(self, company: CompanyRef, recent: dict[str, Any], i: int) -> FilingRef:
+        accession: str = recent["accessionNumber"][i]
+        report_date = recent["reportDate"][i]
+        return FilingRef(
+            accession_number=accession,
+            form_type=recent["form"][i],
+            filing_date=date.fromisoformat(recent["filingDate"][i]),
+            period_end_date=date.fromisoformat(report_date) if report_date else None,
+            filing_url=ARCHIVES_URL.format(
+                cik_int=int(company.cik),
+                accession_nodash=accession.replace("-", ""),
+                document=recent["primaryDocument"][i],
+            ),
+        )
 
     def fetch_document(self, filing: FilingRef) -> str:
         response = self._http.get(filing.filing_url)

@@ -1,6 +1,6 @@
 import hashlib
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Literal, Protocol
 
 import anthropic
 import httpx2 as httpx
@@ -23,14 +23,19 @@ class EdgarGateway(Protocol):
 
     def latest_10k(self, company: CompanyRef) -> FilingRef: ...
 
+    def get_filing(self, company: CompanyRef, accession_number: str) -> FilingRef: ...
+
     def fetch_document(self, filing: FilingRef) -> str: ...
 
 
-class FilingAlreadyIngestedError(Exception):
-    def __init__(self, filing_id: int, accession_number: str) -> None:
-        super().__init__(f"filing {accession_number} already ingested (id={filing_id})")
-        self.filing_id = filing_id
+class UnsupportedFilingTypeError(Exception):
+    def __init__(self, accession_number: str, form_type: str) -> None:
+        super().__init__(
+            f"filing {accession_number} is a {form_type}; only 10-K ingestion is"
+            " supported in this step (ADR-0008 build sequencing: annual-only)"
+        )
         self.accession_number = accession_number
+        self.form_type = form_type
 
 
 class UpstreamError(Exception):
@@ -42,12 +47,13 @@ class UpstreamError(Exception):
 
 @dataclass(frozen=True)
 class ResearchOutcome:
+    status: Literal["ingested", "skipped"]
     company_id: int
     filing_id: int
     accession_number: str
     filing_url: str
     summaries: dict[str, str]
-    thesis_snapshot_id: int
+    thesis_snapshot_id: int | None
 
 
 def compose_thesis(company: CompanyRef, filing: FilingRef, summaries: dict[str, str]) -> str:
@@ -72,17 +78,39 @@ class ResearchService:
         self._summarizer = summarizer
         self._engine = engine
 
-    def run(self, ticker: str) -> ResearchOutcome:
+    def run(self, ticker: str, accession_number: str | None = None) -> ResearchOutcome:
         try:
             company = self._edgar.resolve_ticker(ticker)
-            filing = self._edgar.latest_10k(company)
+            if accession_number is None:
+                filing = self._edgar.latest_10k(company)
+            else:
+                filing = self._edgar.get_filing(company, accession_number)
         except httpx.HTTPError as exc:
             raise UpstreamError("sec-edgar", str(exc)) from exc
 
+        if filing.form_type != "10-K":
+            raise UnsupportedFilingTypeError(filing.accession_number, filing.form_type)
+        if filing.period_end_date is None:
+            # filings.period_end_date is NOT NULL (ADR-0008 §1); a missing EDGAR
+            # reportDate is upstream data we refuse to ingest, not a schema gap.
+            raise UpstreamError(
+                "sec-edgar",
+                f"filing {filing.accession_number} has no reportDate;"
+                " period_end_date is required (ADR-0008 §1)",
+            )
+
         with self._engine.connect() as conn:
-            existing = Repository(conn).find_filing_id(filing.accession_number)
-        if existing is not None:
-            raise FilingAlreadyIngestedError(existing, filing.accession_number)
+            stored = Repository(conn).find_filing(filing.accession_number)
+        if stored is not None:
+            return ResearchOutcome(
+                status="skipped",
+                company_id=stored.company_id,
+                filing_id=stored.id,
+                accession_number=filing.accession_number,
+                filing_url=filing.filing_url,
+                summaries={},
+                thesis_snapshot_id=None,
+            )
 
         try:
             html = self._edgar.fetch_document(filing)
@@ -118,6 +146,7 @@ class ResearchService:
             snapshot_id = repo.insert_thesis_snapshot(company_id, filing_id, thesis)
 
         return ResearchOutcome(
+            status="ingested",
             company_id=company_id,
             filing_id=filing_id,
             accession_number=filing.accession_number,

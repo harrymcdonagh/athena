@@ -24,8 +24,8 @@ from apps.api.research.qa import (
 )
 from apps.api.research.repository import Repository
 from apps.api.research.service import (
-    FilingAlreadyIngestedError,
     ResearchService,
+    UnsupportedFilingTypeError,
     UpstreamError,
 )
 from apps.api.research.summarizer import ClaudeSummarizer, SummarizationError
@@ -69,12 +69,13 @@ def get_qa_answerer() -> QaAnswerer:
 
 class ResearchResponse(BaseModel):
     ticker: str
+    status: Literal["ingested", "skipped"]
     company_id: int
     filing_id: int
     accession_number: str
     filing_url: str
     summaries: dict[str, str]
-    thesis_snapshot_id: int
+    thesis_snapshot_id: int | None
 
 
 class SummaryResponse(BaseModel):
@@ -155,15 +156,17 @@ def qa(
 
 @router.post("/research/{ticker}", response_model=ResearchResponse)
 def run_research(
-    ticker: str, service: Annotated[ResearchService, Depends(get_research_service)]
+    ticker: str,
+    service: Annotated[ResearchService, Depends(get_research_service)],
+    accession_number: Annotated[str | None, Query()] = None,
 ) -> ResearchResponse:
+    # blank or whitespace-only accession_number means "no explicit target"
+    target = accession_number.strip() or None if accession_number else None
     try:
-        outcome = service.run(ticker)
+        outcome = service.run(ticker, target)
     except (TickerNotFoundError, FilingNotFoundError) as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except FilingAlreadyIngestedError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    except SectionExtractionError as exc:
+    except (UnsupportedFilingTypeError, SectionExtractionError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except (UpstreamError, SummarizationError) as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc

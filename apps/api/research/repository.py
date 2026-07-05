@@ -42,6 +42,12 @@ def _vector_literal(embedding: Sequence[float]) -> str:
 
 
 @dataclass(frozen=True)
+class StoredFiling:
+    id: int
+    company_id: int
+
+
+@dataclass(frozen=True)
 class ResearchView:
     ticker: str
     company_name: str
@@ -69,12 +75,14 @@ class Repository:
         ).scalar_one()
         return result
 
-    def find_filing_id(self, accession_number: str) -> int | None:
-        result: int | None = self._conn.execute(
-            text("SELECT id FROM filings WHERE accession_number = :acc"),
+    def find_filing(self, accession_number: str) -> StoredFiling | None:
+        row = self._conn.execute(
+            text("SELECT id, company_id FROM filings WHERE accession_number = :acc"),
             {"acc": accession_number},
-        ).scalar()
-        return result
+        ).one_or_none()
+        if row is None:
+            return None
+        return StoredFiling(id=row.id, company_id=row.company_id)
 
     def insert_filing(self, company_id: int, filing: FilingRef, content_sha256: str) -> int:
         result: int = self._conn.execute(
@@ -248,7 +256,10 @@ class Repository:
                 " JOIN thesis_snapshots t ON t.company_id = c.id"
                 " JOIN filings f ON f.id = t.source_filing_id"
                 " WHERE upper(c.ticker) = upper(:ticker)"
-                " ORDER BY t.created_at DESC, t.id DESC LIMIT 1"
+                # ADR-0008 §1/§4: "latest" follows the filing-period ordering, not
+                # ingestion order, so backfilling an older filing can't hijack it.
+                " ORDER BY f.period_end_date DESC, f.filing_date DESC,"
+                " f.accession_number DESC, t.created_at DESC, t.id DESC LIMIT 1"
             ),
             {"ticker": ticker},
         ).one_or_none()
