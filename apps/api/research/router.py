@@ -1,8 +1,8 @@
 from functools import lru_cache
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import Engine
 
 from apps.api.config import get_settings
@@ -14,6 +14,13 @@ from apps.api.research.embeddings import (
     EmbeddingError,
     VoyageEmbedder,
     semantic_search,
+)
+from apps.api.research.qa import (
+    ClaudeQaAnswerer,
+    QaAnswer,
+    QaAnswerer,
+    QaError,
+    answer_question,
 )
 from apps.api.research.repository import Repository
 from apps.api.research.service import (
@@ -42,6 +49,24 @@ def get_read_engine() -> Engine:
     return get_engine()
 
 
+@lru_cache
+def get_embedder() -> Embedder:
+    settings = get_settings()
+    if not settings.voyage_api_key:
+        raise HTTPException(
+            status_code=503, detail="semantic search unavailable: VOYAGE_API_KEY is not set"
+        )
+    return VoyageEmbedder(api_key=settings.voyage_api_key)
+
+
+@lru_cache
+def get_qa_answerer() -> QaAnswerer:
+    settings = get_settings()
+    if not settings.anthropic_api_key:
+        raise HTTPException(status_code=503, detail="QA unavailable: ANTHROPIC_API_KEY is not set")
+    return ClaudeQaAnswerer(api_key=settings.anthropic_api_key)
+
+
 class ResearchResponse(BaseModel):
     ticker: str
     company_id: int
@@ -60,6 +85,72 @@ class SummaryResponse(BaseModel):
     filing_url: str
     summaries: dict[str, str]
     thesis: str
+
+
+class SearchResult(BaseModel):
+    content: str
+    source_url: str
+    ticker: str
+    section: str
+    filing_id: int
+    chunk_index: int
+    distance: float
+
+
+class QaRequest(BaseModel):
+    question: str
+    ticker: str | None = None
+    section: str | None = None
+    limit: int = Field(default=8, ge=1)
+
+
+class QaWarningResponse(BaseModel):
+    kind: Literal["uncited_claim", "unknown_citation"]
+    message: str
+
+
+class QaResponse(BaseModel):
+    """HTTP mirror of QaResult. `answer` reuses QaAnswer verbatim, so a verdict or
+    recommendation stays structurally unrepresentable (ADR-0007 §3); `citations`
+    carry each chunk's source_url so the audit chain crosses the HTTP boundary."""
+
+    answer: QaAnswer
+    citations: dict[str, SearchResult]
+    warnings: list[QaWarningResponse]
+
+
+# Route matching is sequential: POST /research/qa must be registered before
+# POST /research/{ticker}, or the path-param route captures "qa" as a ticker.
+@router.post("/research/qa", response_model=QaResponse)
+def qa(
+    request: QaRequest,
+    engine: Annotated[Engine, Depends(get_read_engine)],
+    embedder: Annotated[Embedder, Depends(get_embedder)],
+    answerer: Annotated[QaAnswerer, Depends(get_qa_answerer)],
+) -> QaResponse:
+    if request.section is not None and request.section not in SECTIONS:
+        raise HTTPException(
+            status_code=422, detail=f"section must be one of: {', '.join(SECTIONS)}"
+        )
+    try:
+        result = answer_question(
+            engine,
+            embedder,
+            answerer,
+            request.question,
+            limit=min(request.limit, MAX_SEARCH_LIMIT),
+            ticker=request.ticker,
+            section=request.section,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except (EmbeddingError, QaError) as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return QaResponse(
+        answer=result.answer,
+        citations={label: SearchResult(**vars(match)) for label, match in result.citations.items()},
+        warnings=[QaWarningResponse(kind=w.kind, message=w.message) for w in result.warnings],
+    )
 
 
 @router.post("/research/{ticker}", response_model=ResearchResponse)
@@ -96,26 +187,6 @@ def latest_summary(
         summaries=view.summaries,
         thesis=view.thesis,
     )
-
-
-@lru_cache
-def get_embedder() -> Embedder:
-    settings = get_settings()
-    if not settings.voyage_api_key:
-        raise HTTPException(
-            status_code=503, detail="semantic search unavailable: VOYAGE_API_KEY is not set"
-        )
-    return VoyageEmbedder(api_key=settings.voyage_api_key)
-
-
-class SearchResult(BaseModel):
-    content: str
-    source_url: str
-    ticker: str
-    section: str
-    filing_id: int
-    chunk_index: int
-    distance: float
 
 
 @router.get("/research/search", response_model=list[SearchResult])

@@ -185,10 +185,11 @@ def answer_question(
     limit: int = 8,
     *,
     ticker: str | None = None,
+    section: str | None = None,
 ) -> QaResult:
     if not question.strip():
         raise ValueError("question must not be blank")
-    matches = semantic_search(engine, embedder, question, limit, ticker=ticker)
+    matches = semantic_search(engine, embedder, question, limit, ticker=ticker, section=section)
     if not matches:
         return QaResult(
             answer=QaAnswer(

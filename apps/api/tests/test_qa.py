@@ -233,6 +233,41 @@ def test_anthropic_api_error_becomes_qa_error(monkeypatch: pytest.MonkeyPatch) -
         answer_question(ENGINE, EMBEDDER, AnthropicErrorAnswerer(), "What drives revenue?")
 
 
+def test_answer_question_forwards_ticker_and_section_filters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def _search(
+        engine: Engine,
+        embedder: Embedder,
+        query: str,
+        limit: int = 8,
+        *,
+        ticker: str | None = None,
+        section: str | None = None,
+    ) -> list[ChunkMatch]:
+        captured.update(ticker=ticker, section=section, limit=limit)
+        return [chunk(1)]
+
+    monkeypatch.setattr(qa, "semantic_search", _search)
+    answerer = FakeQaAnswerer(
+        QaAnswer(mode="direct", claims=[Claim(text="A stated risk.", chunk_ids=["C1"])])
+    )
+
+    answer_question(
+        ENGINE,
+        EMBEDDER,
+        answerer,
+        "What are the risks?",
+        limit=3,
+        ticker="AAPL",
+        section="risk_factors",
+    )
+
+    assert captured == {"ticker": "AAPL", "section": "risk_factors", "limit": 3}
+
+
 def test_blank_question_raises_value_error(monkeypatch: pytest.MonkeyPatch) -> None:
     # Stub retrieval so this exercises answer_question's own guard, not semantic_search's.
     monkeypatch.setattr(qa, "semantic_search", stub_search([chunk(1)]))
