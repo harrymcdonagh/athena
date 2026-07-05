@@ -9,6 +9,7 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+psycopg://athena:athena@localhost:5433/athena"
     anthropic_api_key: str = ""
     sec_edgar_user_agent: str = ""
+    voyage_api_key: str = ""
 
 
 @lru_cache

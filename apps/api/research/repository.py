@@ -1,9 +1,29 @@
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
+from typing import Protocol
 
 from sqlalchemy import Connection, text
 
 from apps.api.edgar.client import FilingRef
+
+
+class ChunkLike(Protocol):
+    """Structural type for embedded chunks (see apps.api.research.embeddings)."""
+
+    @property
+    def text(self) -> str: ...
+
+    @property
+    def embedding(self) -> list[float]: ...
+
+
+@dataclass(frozen=True)
+class PendingSection:
+    filing_id: int
+    section: str
+    source_text: str
+    source_url: str
 
 
 @dataclass(frozen=True)
@@ -87,6 +107,64 @@ class Repository:
             },
         ).scalar_one()
         return result
+
+    def sections_pending_embedding(self, model: str) -> list[PendingSection]:
+        rows = self._conn.execute(
+            text(
+                "SELECT s.filing_id, s.section, s.source_text, s.source_url"
+                " FROM filing_summaries s"
+                " WHERE NOT EXISTS ("
+                "   SELECT 1 FROM filing_chunks c"
+                "   WHERE c.filing_id = s.filing_id AND c.section = s.section"
+                "     AND c.model = :model)"
+                " ORDER BY s.filing_id, s.section"
+            ),
+            {"model": model},
+        ).all()
+        return [
+            PendingSection(
+                filing_id=row.filing_id,
+                section=row.section,
+                source_text=row.source_text,
+                source_url=row.source_url,
+            )
+            for row in rows
+        ]
+
+    def replace_chunks(
+        self,
+        filing_id: int,
+        section: str,
+        source_url: str,
+        chunks: Sequence[ChunkLike],
+        *,
+        model: str,
+        dimension: int,
+    ) -> int:
+        self._conn.execute(
+            text("DELETE FROM filing_chunks WHERE filing_id = :filing_id AND section = :section"),
+            {"filing_id": filing_id, "section": section},
+        )
+        for index, chunk in enumerate(chunks):
+            self._conn.execute(
+                text(
+                    "INSERT INTO filing_chunks (filing_id, section, source_url, chunk_index,"
+                    " content, embedding, model, dimension)"
+                    " VALUES (:filing_id, :section, :source_url, :chunk_index, :content,"
+                    " CAST(:embedding AS vector), :model, :dimension)"
+                ),
+                {
+                    "filing_id": filing_id,
+                    "section": section,
+                    "source_url": source_url,
+                    "chunk_index": index,
+                    "content": chunk.text,
+                    "embedding": "[" + ",".join(map(str, chunk.embedding)) + "]",
+                    "model": model,
+                    "dimension": dimension,
+                },
+            )
+        return len(chunks)
 
     def insert_thesis_snapshot(self, company_id: int, filing_id: int, content: str) -> int:
         result: int = self._conn.execute(

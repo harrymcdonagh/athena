@@ -45,8 +45,8 @@ def db(db_engine: Engine) -> Iterator[Engine]:
     with db_engine.begin() as conn:
         conn.execute(
             text(
-                "TRUNCATE companies, filings, filing_summaries, thesis_snapshots"
-                " RESTART IDENTITY CASCADE"
+                "TRUNCATE companies, filings, filing_summaries, filing_chunks,"
+                " thesis_snapshots RESTART IDENTITY CASCADE"
             )
         )
     yield db_engine
