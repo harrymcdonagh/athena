@@ -5,6 +5,7 @@ from typing import Any
 import httpx2 as httpx
 
 COMPANY_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
+EXCHANGE_TICKERS_URL = "https://www.sec.gov/files/company_tickers_exchange.json"
 SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik}.json"
 ARCHIVES_URL = "https://www.sec.gov/Archives/edgar/data/{cik_int}/{accession_nodash}/{document}"
 
@@ -26,6 +27,20 @@ class CompanyRef:
     ticker: str
     cik: str
     name: str
+
+
+@dataclass(frozen=True)
+class TickerReferenceRow:
+    """One row of the SEC's ticker→identity mapping (ADR-0010 #1).
+
+    SEC-authoritative identity fields only (ADR-0010 #6). cik is zero-padded
+    to 10 digits, the same canonical form CompanyRef and companies.cik use.
+    """
+
+    ticker: str
+    cik: str
+    company_name: str
+    exchange: str | None
 
 
 @dataclass(frozen=True)
@@ -59,6 +74,48 @@ class EdgarClient:
         except KeyError as exc:
             raise EdgarError(f"unexpected EDGAR response shape: missing {exc}") from exc
         raise TickerNotFoundError(f"ticker {ticker!r} not found on SEC EDGAR")
+
+    def fetch_ticker_reference(self) -> list[TickerReferenceRow]:
+        """The SEC's full ticker→identity universe, for the ADR-0010 cache.
+
+        Sourced from the _exchange variant: same ticker universe as
+        company_tickers.json (verified identical, 2026-07-06) plus the
+        exchange column, which ADR-0010 #6 puts in scope. Its shape is
+        columnar — {"fields": [...], "data": [[cik, name, ticker,
+        exchange], ...]} with integer CIKs and nullable exchange — and is an
+        external contract (ADR-0010 risk): any deviation, including a
+        duplicate ticker, is a hard error, never a silent partial load.
+        """
+        data = self._get_json(EXCHANGE_TICKERS_URL)
+        rows: list[TickerReferenceRow] = []
+        try:
+            fields: list[str] = data["fields"]
+            col = {name: fields.index(name) for name in ("cik", "name", "ticker", "exchange")}
+            for raw in data["data"]:
+                cik, name = raw[col["cik"]], raw[col["name"]]
+                ticker, exchange = raw[col["ticker"]], raw[col["exchange"]]
+                if (
+                    not isinstance(cik, int)
+                    or not (isinstance(ticker, str) and ticker.strip())
+                    or not (isinstance(name, str) and name.strip())
+                    or not (exchange is None or isinstance(exchange, str))
+                ):
+                    raise ValueError(f"malformed ticker reference row: {raw!r}")
+                rows.append(
+                    TickerReferenceRow(
+                        ticker=ticker.upper(),
+                        cik=f"{cik:010d}",
+                        company_name=name,
+                        exchange=exchange or None,
+                    )
+                )
+        except (KeyError, IndexError, TypeError, ValueError) as exc:
+            raise EdgarError(f"unexpected EDGAR response shape: {exc!r}") from exc
+        if not rows:
+            raise EdgarError("unexpected EDGAR response shape: empty ticker reference")
+        if len({row.ticker for row in rows}) != len(rows):
+            raise EdgarError("unexpected EDGAR response shape: duplicate tickers in reference")
+        return rows
 
     def latest_10k(self, company: CompanyRef) -> FilingRef:
         filings = self.list_filings(company, "10-K")
