@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Protocol
 
-from sqlalchemy import Connection, text
+from sqlalchemy import Connection, bindparam, text
 
 from apps.api.edgar.client import FilingRef
 
@@ -45,6 +45,12 @@ def _vector_literal(embedding: Sequence[float]) -> str:
 class StoredFiling:
     id: int
     company_id: int
+
+
+@dataclass(frozen=True)
+class FilingPeriod:
+    filing_id: int
+    period_end_date: date
 
 
 @dataclass(frozen=True)
@@ -223,6 +229,66 @@ class Repository:
                 " LIMIT :limit"
             ),
             params,
+        ).all()
+        return [
+            ChunkMatch(
+                ticker=row.ticker,
+                filing_id=row.filing_id,
+                section=row.section,
+                chunk_index=row.chunk_index,
+                content=row.content,
+                source_url=row.source_url,
+                distance=row.distance,
+            )
+            for row in rows
+        ]
+
+    def filing_periods(self, filing_ids: Sequence[int]) -> list[FilingPeriod]:
+        """The given filings ordered newest-first by the ADR-0008 §1 period
+        ordering (period_end_date, then filing_date, then accession_number).
+        Unknown ids are simply absent from the result; the caller decides
+        whether that is an error."""
+        if not filing_ids:
+            return []
+        rows = self._conn.execute(
+            text(
+                "SELECT id, period_end_date FROM filings WHERE id IN :ids"
+                " ORDER BY period_end_date DESC, filing_date DESC, accession_number DESC"
+            ).bindparams(bindparam("ids", expanding=True)),
+            {"ids": list(filing_ids)},
+        ).all()
+        return [FilingPeriod(filing_id=row.id, period_end_date=row.period_end_date) for row in rows]
+
+    def search_chunks_in_filing(
+        self,
+        query_embedding: Sequence[float],
+        *,
+        model: str,
+        filing_id: int,
+        limit: int,
+    ) -> list[ChunkMatch]:
+        """Top-k by cosine distance within ONE filing's chunks (ADR-0009 §2).
+
+        The balanced-retrieval path runs one of these per filing so each
+        period returns its own nearest chunks; a high-scoring filing cannot
+        starve another. The ADR-0007 cross-corpus path is search_chunks."""
+        rows = self._conn.execute(
+            text(
+                "SELECT co.ticker, fc.filing_id, fc.section, fc.chunk_index, fc.content,"
+                " fc.source_url, fc.embedding <=> CAST(:query AS vector) AS distance"
+                " FROM filing_chunks fc"
+                " JOIN filings f ON f.id = fc.filing_id"
+                " JOIN companies co ON co.id = f.company_id"
+                " WHERE fc.model = :model AND fc.filing_id = :filing_id"
+                " ORDER BY fc.embedding <=> CAST(:query AS vector)"
+                " LIMIT :limit"
+            ),
+            {
+                "query": _vector_literal(query_embedding),
+                "model": model,
+                "filing_id": filing_id,
+                "limit": limit,
+            },
         ).all()
         return [
             ChunkMatch(

@@ -1,4 +1,5 @@
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -129,6 +130,57 @@ def semantic_search(
         return Repository(conn).search_chunks(
             query_embedding, model=embedder.model, limit=limit, ticker=ticker, section=section
         )
+
+
+def balanced_semantic_search(
+    engine: Engine,
+    embedder: Embedder,
+    query: str,
+    filing_ids: Sequence[int],
+    limit: int = 8,
+) -> list[ChunkMatch]:
+    """Balanced per-period retrieval for change detection (ADR-0009 §2).
+
+    Each filing is one period. The budget is partitioned by filing — ⌊L/P⌋
+    chunks each, remainder to the most recent period(s) by the ADR-0008 §1
+    ordering — and each filing gets its OWN top-k similarity search, so a
+    high-scoring filing cannot starve another the way raw top-k does. The
+    ADR-0007 path (semantic_search) is untouched; this lives alongside it.
+    """
+    if not query.strip():
+        raise ValueError("query must not be blank")
+    unique_ids = list(dict.fromkeys(filing_ids))  # dedupe before partitioning
+    if not unique_ids:
+        raise ValueError("filing_ids must not be empty")
+    query_embedding = embedder.embed_query(query)  # once; reused across per-filing searches
+    matches: list[ChunkMatch] = []
+    with engine.connect() as conn:
+        repo = Repository(conn)
+        periods = repo.filing_periods(unique_ids)  # newest first
+        if len(periods) != len(unique_ids):
+            missing = sorted(set(unique_ids) - {p.filing_id for p in periods})
+            raise ValueError(f"unknown filing_id(s): {missing}")
+        base, remainder = divmod(limit, len(periods))
+        for i, period in enumerate(periods):
+            # Newest periods get the remainder slots. When L < P, base is 0 and
+            # only the most-recent L filings get a slot (at least 1 each) —
+            # mirroring how the rest of the codebase degrades limits (clamp,
+            # don't error) rather than raising.
+            allotment = base + (1 if i < remainder else 0)
+            if allotment == 0:
+                continue
+            # A filing with fewer chunks than its allotment returns what it
+            # has; no backfill from other filings, which would reintroduce
+            # exactly the period skew this function exists to remove.
+            matches.extend(
+                repo.search_chunks_in_filing(
+                    query_embedding,
+                    model=embedder.model,
+                    filing_id=period.filing_id,
+                    limit=allotment,
+                )
+            )
+    return matches
 
 
 def main() -> None:

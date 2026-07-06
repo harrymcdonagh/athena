@@ -1,4 +1,5 @@
 import logging
+from collections import Counter
 from types import SimpleNamespace
 
 import pytest
@@ -10,10 +11,11 @@ from apps.api.research.embeddings import (
     Embedder,
     EmbeddingError,
     VoyageEmbedder,
+    balanced_semantic_search,
     run_backfill,
     semantic_search,
 )
-from apps.api.research.repository import Repository
+from apps.api.research.repository import ChunkMatch, Repository
 
 # --- VoyageEmbedder unit tests (fake Voyage client, no network) ---
 
@@ -518,6 +520,171 @@ def test_semantic_search_embeds_query_and_returns_nearest_chunks(db: Engine) -> 
 def test_semantic_search_rejects_blank_query(db: Engine) -> None:
     with pytest.raises(ValueError, match="query"):
         semantic_search(db, FakeEmbedder(), "   ")
+
+
+# --- balanced per-period retrieval (ADR-0009 §2, real test database) ---
+
+
+def seed_prior_period_filing(db: Engine) -> int:
+    """Same company as seed_filing, one fiscal year earlier."""
+    return seed_filing(
+        db,
+        accession="0000320193-24-000100",
+        filing_date="2024-11-01",
+        period_end_date="2024-09-28",
+        filing_url="https://sec.gov/old-10k.htm",
+    )
+
+
+def seed_vector_chunks(db: Engine, filing_id: int, vectors: list[list[float]]) -> None:
+    chunks = [
+        EmbeddedChunk(text=f"filing {filing_id} chunk {i}", embedding=vector)
+        for i, vector in enumerate(vectors)
+    ]
+    with db.begin() as conn:
+        Repository(conn).replace_chunks(
+            filing_id,
+            "mdna",
+            "https://sec.gov/filing.htm",
+            chunks,
+            model="voyage-context-4",
+            dimension=1024,
+        )
+
+
+def spy_per_filing_searches(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Record the filing_id of every per-filing search without changing behavior."""
+    searched: list[int] = []
+    original = Repository.search_chunks_in_filing
+
+    def spy(
+        self: Repository,
+        query_embedding: list[float],
+        *,
+        model: str,
+        filing_id: int,
+        limit: int,
+    ) -> list[ChunkMatch]:
+        searched.append(filing_id)
+        return original(self, query_embedding, model=model, filing_id=filing_id, limit=limit)
+
+    monkeypatch.setattr(Repository, "search_chunks_in_filing", spy)
+    return searched
+
+
+def test_balanced_search_splits_evenly_between_two_filings(
+    db: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    newer = seed_filing(db)
+    older = seed_prior_period_filing(db)
+    seed_vector_chunks(db, newer, [axis_vector(i) for i in range(6)])
+    seed_vector_chunks(db, older, [axis_vector(i) for i in range(6)])
+    embedder = QueryOnlyEmbedder(axis_vector(0))
+    searched = spy_per_filing_searches(monkeypatch)
+
+    matches = balanced_semantic_search(db, embedder, "growth", [older, newer], limit=8)
+
+    counts = Counter(m.filing_id for m in matches)
+    assert counts == {newer: 4, older: 4}
+    assert embedder.queries == ["growth"]  # the query is embedded exactly once
+    assert sorted(searched) == sorted([newer, older])  # one separate search per filing
+
+
+def test_balanced_search_gives_remainder_to_most_recent_period(db: Engine) -> None:
+    newer = seed_filing(db)
+    older = seed_prior_period_filing(db)
+    seed_vector_chunks(db, newer, [axis_vector(i) for i in range(6)])
+    seed_vector_chunks(db, older, [axis_vector(i) for i in range(6)])
+
+    # Input order is oldest-first on purpose: allocation must key on
+    # period_end_date, not on the order the caller happened to pass.
+    matches = balanced_semantic_search(
+        db, QueryOnlyEmbedder(axis_vector(0)), "growth", [older, newer], limit=7
+    )
+
+    counts = Counter(m.filing_id for m in matches)
+    assert counts == {newer: 4, older: 3}
+
+
+def test_balanced_search_fixes_top_k_period_skew(db: Engine) -> None:
+    """The bug from the live 2026-07-05 run: raw top-k lets one period starve
+    the other. Here the older filing's chunks all outscore the newer's, so raw
+    top-8 returns 6/2; balanced retrieval must return 4/4."""
+    newer = seed_filing(db)
+    older = seed_prior_period_filing(db)
+    seed_vector_chunks(db, newer, [axis_vector(1)] * 8)  # orthogonal to the query
+    seed_vector_chunks(db, older, [axis_vector(0)] * 6)  # exact match to the query
+
+    with db.connect() as conn:
+        raw = Repository(conn).search_chunks(
+            axis_vector(0), model="voyage-context-4", limit=8, ticker="AAPL"
+        )
+    assert Counter(m.filing_id for m in raw) == {older: 6, newer: 2}  # the skew
+
+    matches = balanced_semantic_search(
+        db, QueryOnlyEmbedder(axis_vector(0)), "growth", [newer, older], limit=8
+    )
+    assert Counter(m.filing_id for m in matches) == {newer: 4, older: 4}
+
+
+def test_balanced_search_does_not_backfill_a_short_filing(db: Engine) -> None:
+    newer = seed_filing(db)
+    older = seed_prior_period_filing(db)
+    seed_vector_chunks(db, newer, [axis_vector(i) for i in range(6)])
+    seed_vector_chunks(db, older, [axis_vector(0), axis_vector(1)])  # only 2 available
+
+    matches = balanced_semantic_search(
+        db, QueryOnlyEmbedder(axis_vector(0)), "growth", [older, newer], limit=8
+    )
+
+    counts = Counter(m.filing_id for m in matches)
+    assert counts == {newer: 4, older: 2}  # older returns what it has; no backfill
+
+
+def test_balanced_search_dedupes_filing_ids(db: Engine) -> None:
+    newer = seed_filing(db)
+    older = seed_prior_period_filing(db)
+    seed_vector_chunks(db, newer, [axis_vector(i) for i in range(6)])
+    seed_vector_chunks(db, older, [axis_vector(i) for i in range(6)])
+
+    matches = balanced_semantic_search(
+        db, QueryOnlyEmbedder(axis_vector(0)), "growth", [newer, newer, older], limit=8
+    )
+
+    counts = Counter(m.filing_id for m in matches)
+    assert counts == {newer: 4, older: 4}  # P=2 after dedupe, not P=3
+
+
+def test_balanced_search_degenerate_limit_serves_most_recent_filings_only(db: Engine) -> None:
+    newer = seed_filing(db)
+    older = seed_prior_period_filing(db)
+    seed_vector_chunks(db, newer, [axis_vector(i) for i in range(3)])
+    seed_vector_chunks(db, older, [axis_vector(i) for i in range(3)])
+
+    matches = balanced_semantic_search(
+        db, QueryOnlyEmbedder(axis_vector(0)), "growth", [older, newer], limit=1
+    )
+
+    counts = Counter(m.filing_id for m in matches)
+    assert counts == {newer: 1}  # L < P: at least 1 each to the most-recent L filings
+
+
+def test_balanced_search_unknown_filing_id_raises(db: Engine) -> None:
+    newer = seed_filing(db)
+    with pytest.raises(ValueError, match="unknown filing_id"):
+        balanced_semantic_search(
+            db, QueryOnlyEmbedder(axis_vector(0)), "growth", [newer, 999999], limit=8
+        )
+
+
+def test_balanced_search_rejects_blank_query(db: Engine) -> None:
+    with pytest.raises(ValueError, match="query"):
+        balanced_semantic_search(db, FakeEmbedder(), "   ", [1], limit=8)
+
+
+def test_balanced_search_rejects_empty_filing_ids(db: Engine) -> None:
+    with pytest.raises(ValueError, match="filing_ids"):
+        balanced_semantic_search(db, FakeEmbedder(), "growth", [], limit=8)
 
 
 # --- ticker/section filters (real test database) ---
