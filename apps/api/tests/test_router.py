@@ -8,11 +8,13 @@ from apps.api.config import Settings
 from apps.api.edgar.client import CompanyRef, TickerNotFoundError
 from apps.api.main import app
 from apps.api.research.embeddings import EmbeddedChunk, EmbeddingError
-from apps.api.research.qa import Claim, QaAnswer, QaAnswerer
+from apps.api.research.qa import Claim, ComparisonDraft, ComparisonResult, QaAnswer, QaAnswerer
 from apps.api.research.repository import Repository
 from apps.api.research.router import (
+    ComparisonResponse,
     QaResponse,
     ResearchResponse,
+    get_comparison_answerer,
     get_embedder,
     get_qa_answerer,
     get_read_engine,
@@ -23,9 +25,15 @@ from apps.api.tests.test_embeddings import (
     QueryOnlyEmbedder,
     axis_vector,
     seed_filing,
+    seed_prior_period_filing,
     seed_second_company_filing,
 )
-from apps.api.tests.test_qa import TWO_SIDED, AnthropicErrorAnswerer, FakeQaAnswerer
+from apps.api.tests.test_qa import (
+    TWO_SIDED,
+    AnthropicErrorAnswerer,
+    FakeComparisonAnswerer,
+    FakeQaAnswerer,
+)
 from apps.api.tests.test_service import EIGHT_K, FILING, PRIOR_FILING, FakeEdgar, FakeSummarizer
 
 
@@ -463,6 +471,118 @@ def test_qa_missing_voyage_key_returns_503(db: Engine, monkeypatch: pytest.Monke
         get_qa_answerer.cache_clear()
         app.dependency_overrides.clear()
     assert response.status_code == 503
+
+
+# --- POST /research/qa with compare=true (ADR-0009 §7) ---
+
+
+def use_comparison_answerer(answerer: FakeComparisonAnswerer) -> None:
+    app.dependency_overrides[get_comparison_answerer] = lambda: answerer
+
+
+def test_qa_compare_off_and_omitted_return_exact_qa_response(
+    qa_client: TestClient, db: Engine
+) -> None:
+    seed_search_corpus(db)
+    use_answerer(FakeQaAnswerer(DIRECT))
+    for payload in (
+        {"question": "what drives revenue?"},
+        {"question": "what drives revenue?", "compare": False},
+    ):
+        response = qa_client.post("/research/qa", json=payload)
+        assert response.status_code == 200
+        body = response.json()
+        assert set(body) == set(QaResponse.model_fields)  # today's ADR-0007 shape exactly
+        assert "period_comparison" not in body
+
+
+def test_qa_compare_resolves_previous_comparable_pair(
+    qa_client: TestClient, db: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    newer = seed_filing(db)
+    older = seed_prior_period_filing(db)
+    use_answerer(FakeQaAnswerer(DIRECT))
+    use_comparison_answerer(FakeComparisonAnswerer(ComparisonDraft()))
+    captured: dict[str, object] = {}
+
+    def fake_detect_changes(
+        engine: Engine,
+        embedder: object,
+        answerer: object,
+        question: str,
+        filing_ids: list[int],
+        limit: int = 8,
+    ) -> ComparisonResult:
+        captured.update(question=question, filing_ids=list(filing_ids), limit=limit)
+        return ComparisonResult(period_comparison=[], citations={}, warnings=[], explanation="stub")
+
+    monkeypatch.setattr("apps.api.research.router.detect_changes", fake_detect_changes)
+
+    response = qa_client.post(
+        "/research/qa",
+        json={"question": "what changed year over year?", "ticker": "AAPL", "compare": True},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert set(body) == set(ComparisonResponse.model_fields)
+    # Latest 10-K first, previous COMPARABLE 10-K second (ADR-0008 §3).
+    assert captured["filing_ids"] == [newer, older]
+    assert captured["question"] == "what changed year over year?"
+
+
+def test_qa_compare_single_filing_returns_200_no_prior_comparable(
+    qa_client: TestClient, db: Engine
+) -> None:
+    seed_filing(db)  # one 10-K only
+    use_answerer(FakeQaAnswerer(DIRECT))
+    use_comparison_answerer(FakeComparisonAnswerer(ComparisonDraft()))
+
+    response = qa_client.post(
+        "/research/qa", json={"question": "what changed?", "ticker": "AAPL", "compare": True}
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["period_comparison"] == []
+    assert body["citations"] == {}
+    assert "no prior comparable" in body["explanation"].lower()
+
+
+def test_qa_compare_unknown_ticker_returns_404(qa_client: TestClient) -> None:
+    use_answerer(FakeQaAnswerer(DIRECT))
+    use_comparison_answerer(FakeComparisonAnswerer(ComparisonDraft()))
+    response = qa_client.post(
+        "/research/qa", json={"question": "what changed?", "ticker": "ZZZZ", "compare": True}
+    )
+    assert response.status_code == 404
+    assert "no research stored" in response.json()["detail"]
+
+
+def test_qa_compare_without_ticker_returns_422(qa_client: TestClient) -> None:
+    use_answerer(FakeQaAnswerer(DIRECT))
+    use_comparison_answerer(FakeComparisonAnswerer(ComparisonDraft()))
+    response = qa_client.post("/research/qa", json={"question": "what changed?", "compare": True})
+    assert response.status_code == 422
+    assert "ticker" in response.json()["detail"]
+
+
+def test_qa_compare_rejects_section_filter(qa_client: TestClient, db: Engine) -> None:
+    seed_filing(db)
+    seed_prior_period_filing(db)
+    use_answerer(FakeQaAnswerer(DIRECT))
+    use_comparison_answerer(FakeComparisonAnswerer(ComparisonDraft()))
+    response = qa_client.post(
+        "/research/qa",
+        json={
+            "question": "what changed?",
+            "ticker": "AAPL",
+            "section": "risk_factors",
+            "compare": True,
+        },
+    )
+    assert response.status_code == 422
+    assert "section" in response.json()["detail"]
 
 
 def test_qa_clamps_limit_to_max(qa_client: TestClient, db: Engine) -> None:

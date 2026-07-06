@@ -16,11 +16,14 @@ from apps.api.research.embeddings import (
     semantic_search,
 )
 from apps.api.research.qa import (
+    ChangeEntry,
     ClaudeQaAnswerer,
+    ComparisonAnswerer,
     QaAnswer,
     QaAnswerer,
     QaError,
     answer_question,
+    detect_changes,
 )
 from apps.api.research.repository import Repository
 from apps.api.research.service import (
@@ -67,6 +70,16 @@ def get_qa_answerer() -> QaAnswerer:
     return ClaudeQaAnswerer(api_key=settings.anthropic_api_key)
 
 
+@lru_cache
+def get_comparison_answerer() -> ComparisonAnswerer:
+    # Separate provider so the change-detection path is typed against its own
+    # Protocol and independently overridable in tests; same client underneath.
+    settings = get_settings()
+    if not settings.anthropic_api_key:
+        raise HTTPException(status_code=503, detail="QA unavailable: ANTHROPIC_API_KEY is not set")
+    return ClaudeQaAnswerer(api_key=settings.anthropic_api_key)
+
+
 class ResearchResponse(BaseModel):
     ticker: str
     status: Literal["ingested", "skipped"]
@@ -103,6 +116,9 @@ class QaRequest(BaseModel):
     ticker: str | None = None
     section: str | None = None
     limit: int = Field(default=8, ge=1)
+    # ADR-0009 §7: change detection is explicitly requested, never inferred
+    # from question text. Default off = today's ADR-0007 path, unchanged.
+    compare: bool = False
 
 
 class QaWarningResponse(BaseModel):
@@ -125,15 +141,80 @@ class QaResponse(BaseModel):
     warnings: list[QaWarningResponse]
 
 
+class ComparisonResponse(BaseModel):
+    """HTTP mirror of ComparisonResult (ADR-0009). Its own response shape behind
+    the explicit compare flag — period_comparison is never a field on QaResponse,
+    so flag-off callers receive today's ADR-0007 shape unchanged."""
+
+    period_comparison: list[ChangeEntry]
+    citations: dict[str, SearchResult]
+    warnings: list[QaWarningResponse]
+    explanation: str
+
+
+def _run_comparison(
+    request: QaRequest, engine: Engine, embedder: Embedder, answerer: ComparisonAnswerer
+) -> ComparisonResponse:
+    if request.ticker is None or not request.ticker.strip():
+        raise HTTPException(status_code=422, detail="ticker is required when compare is true")
+    if request.section is not None:
+        raise HTTPException(
+            status_code=422, detail="section filter is not supported when compare is true"
+        )
+    with engine.connect() as conn:
+        # ADR-0008 §3: the previous COMPARABLE filing is the previous filing OF
+        # THE SAME form_type. The form_type filter is applied BEFORE indexing —
+        # load-bearing: indexing an unfiltered list would pair a 10-K with a
+        # 10-Q once quarterlies are ingested.
+        comparable = Repository(conn).filings_for_company(request.ticker, form_type="10-K")
+    if not comparable:
+        raise HTTPException(status_code=404, detail=f"no research stored for {request.ticker!r}")
+    if len(comparable) == 1:
+        # Endpoint-level analog of the no_prior_period guard: an honest 200,
+        # never a fabricated comparison and never a 500.
+        return ComparisonResponse(
+            period_comparison=[],
+            citations={},
+            warnings=[],
+            explanation=(
+                f"No prior comparable filing: only one 10-K is stored for"
+                f" {request.ticker.upper()}, so there is no prior period to compare."
+            ),
+        )
+    latest, previous_comparable = comparable[0], comparable[1]
+    try:
+        result = detect_changes(
+            engine,
+            embedder,
+            answerer,
+            request.question,
+            [latest.filing_id, previous_comparable.filing_id],
+            limit=min(request.limit, MAX_SEARCH_LIMIT),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except (EmbeddingError, QaError) as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return ComparisonResponse(
+        period_comparison=result.period_comparison,
+        citations={label: SearchResult(**vars(match)) for label, match in result.citations.items()},
+        warnings=[QaWarningResponse(kind=w.kind, message=w.message) for w in result.warnings],
+        explanation=result.explanation,
+    )
+
+
 # Route matching is sequential: POST /research/qa must be registered before
 # POST /research/{ticker}, or the path-param route captures "qa" as a ticker.
-@router.post("/research/qa", response_model=QaResponse)
+@router.post("/research/qa", response_model=QaResponse | ComparisonResponse)
 def qa(
     request: QaRequest,
     engine: Annotated[Engine, Depends(get_read_engine)],
     embedder: Annotated[Embedder, Depends(get_embedder)],
     answerer: Annotated[QaAnswerer, Depends(get_qa_answerer)],
-) -> QaResponse:
+    comparison_answerer: Annotated[ComparisonAnswerer, Depends(get_comparison_answerer)],
+) -> QaResponse | ComparisonResponse:
+    if request.compare:
+        return _run_comparison(request, engine, embedder, comparison_answerer)
     if request.section is not None and request.section not in SECTIONS:
         raise HTTPException(
             status_code=422, detail=f"section must be one of: {', '.join(SECTIONS)}"

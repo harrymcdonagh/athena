@@ -259,6 +259,31 @@ class Repository:
         ).all()
         return [FilingPeriod(filing_id=row.id, period_end_date=row.period_end_date) for row in rows]
 
+    def filings_for_company(self, ticker: str, form_type: str | None = None) -> list[FilingPeriod]:
+        """A company's ingested filings, newest first by the ADR-0008 §1
+        ordering. With form_type set, this makes the §3 definitions directly
+        computable: [0] is the latest filing of that type and [1] its previous
+        COMPARABLE filing — filter first, then index; indexing an unfiltered
+        list would pair unlike forms (e.g. a 10-K with a 10-Q). Unknown ticker
+        yields an empty list."""
+        filters = ""
+        params: dict[str, object] = {"ticker": ticker}
+        if form_type is not None:
+            filters = " AND f.form_type = :form_type"
+            params["form_type"] = form_type
+        rows = self._conn.execute(
+            text(
+                "SELECT f.id, f.period_end_date FROM filings f"
+                " JOIN companies c ON c.id = f.company_id"
+                " WHERE upper(c.ticker) = upper(:ticker)"
+                + filters
+                + " ORDER BY f.period_end_date DESC, f.filing_date DESC,"
+                " f.accession_number DESC"
+            ),
+            params,
+        ).all()
+        return [FilingPeriod(filing_id=row.id, period_end_date=row.period_end_date) for row in rows]
+
     def search_chunks_in_filing(
         self,
         query_embedding: Sequence[float],
