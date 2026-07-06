@@ -10,6 +10,8 @@ class Settings(BaseSettings):
     anthropic_api_key: str = ""
     sec_edgar_user_agent: str = ""
     voyage_api_key: str = ""
+    # Pause between companies in batch ingestion (SEC fair-access politeness).
+    edgar_batch_delay_seconds: float = 1.0
 
 
 @lru_cache
