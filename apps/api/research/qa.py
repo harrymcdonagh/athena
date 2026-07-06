@@ -8,7 +8,9 @@ ADR's final consequence — review changes against the ADR, not as copy tweaks.
 
 import argparse
 import re
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import date
 from typing import Literal, Protocol
 
 import anthropic
@@ -16,8 +18,13 @@ from pydantic import BaseModel, Field
 from sqlalchemy import Engine, create_engine
 
 from apps.api.config import get_settings
-from apps.api.research.embeddings import Embedder, VoyageEmbedder, semantic_search
-from apps.api.research.repository import ChunkMatch
+from apps.api.research.embeddings import (
+    Embedder,
+    VoyageEmbedder,
+    balanced_semantic_search,
+    semantic_search,
+)
+from apps.api.research.repository import ChunkMatch, Repository
 
 _MODEL = "claude-opus-4-8"
 
@@ -109,7 +116,9 @@ class QaAnswer(BaseModel):
 
 @dataclass(frozen=True)
 class QaWarning:
-    kind: Literal["uncited_claim", "unknown_citation", "reasoning_artifact"]
+    kind: Literal[
+        "uncited_claim", "unknown_citation", "reasoning_artifact", "missing_period_citation"
+    ]
     message: str
 
 
@@ -132,6 +141,24 @@ _ARTIFACT_PATTERNS: tuple[re.Pattern[str], ...] = (
         r"|as an ai|system (?:message|prompt)|my previous (?:answer|response))\b"
     ),
 )
+
+
+def _artifact_warnings(field_name: str, value: str) -> list[QaWarning]:
+    """Flag (never strip) leaked-reasoning artifacts in a free-text field."""
+    warnings: list[QaWarning] = []
+    for pattern in _ARTIFACT_PATTERNS:
+        found = pattern.search(value)
+        if found:
+            warnings.append(
+                QaWarning(
+                    kind="reasoning_artifact",
+                    message=(
+                        f"{field_name} contains a suspected leaked-reasoning"
+                        f" artifact: {found.group(0)!r}"
+                    ),
+                )
+            )
+    return warnings
 
 
 @dataclass(frozen=True)
@@ -173,6 +200,23 @@ class ClaudeQaAnswerer:
             raise QaError(f"model returned no parsed answer (stop_reason={response.stop_reason!r})")
         return answer
 
+    def compare(
+        self, question: str, chunks: dict[str, ChunkMatch], periods: "Mapping[int, date]"
+    ) -> "ComparisonDraft":
+        response = self._client.messages.parse(
+            model=self.model,
+            max_tokens=16000,
+            system=_COMPARISON_SYSTEM_PROMPT,
+            messages=[
+                {"role": "user", "content": build_comparison_prompt(question, chunks, periods)}
+            ],
+            output_format=ComparisonDraft,
+        )
+        draft = response.parsed_output
+        if draft is None:
+            raise QaError(f"model returned no parsed draft (stop_reason={response.stop_reason!r})")
+        return draft
+
 
 def _all_claims(answer: QaAnswer) -> list[Claim]:
     return [*answer.claims, *answer.bull, *answer.bear, *answer.what_changed]
@@ -193,18 +237,7 @@ def verify_answer(answer: QaAnswer, retrieved: dict[str, ChunkMatch]) -> list[Qa
         ("explanation", answer.explanation),
         ("verdict_note", answer.verdict_note),
     ):
-        for pattern in _ARTIFACT_PATTERNS:
-            found = pattern.search(value)
-            if found:
-                warnings.append(
-                    QaWarning(
-                        kind="reasoning_artifact",
-                        message=(
-                            f"{field_name} contains a suspected leaked-reasoning"
-                            f" artifact: {found.group(0)!r}"
-                        ),
-                    )
-                )
+        warnings.extend(_artifact_warnings(field_name, value))
     for claim in _all_claims(answer):
         if not claim.chunk_ids:
             warnings.append(
@@ -255,6 +288,301 @@ def answer_question(
     except anthropic.APIError as exc:
         raise QaError(f"anthropic: {exc}") from exc
     return QaResult(answer=answer, citations=chunks, warnings=verify_answer(answer, chunks))
+
+
+# --- change detection (ADR-0009): grounded comparison at QA time ---
+#
+# ADDITIVE to ADR-0007: the comparison shapes below are separate from QaAnswer,
+# so the flag-off QA path keeps its exact schema (including what_changed as
+# list[Claim]) and its model-facing output format, byte for byte.
+#
+# The model-facing draft carries chunk LABELS only — no URLs, no dates — so
+# provenance is stamped mechanically from retrieval, never generated.
+
+_COMPARISON_SYSTEM_PROMPT = (
+    "You are Athena's change-detection layer for SEC filing research. You compare"
+    " what a company's filings state across periods, using ONLY the evidence"
+    " chunks supplied in the user message, each labelled C1, C2, ... and tagged"
+    " with its filing's period_end_date.\n"
+    "\n"
+    "Grounding — hard constraint (ADR-0007 §4 carries over):\n"
+    "- Use ONLY the supplied chunks. Your background knowledge about the company"
+    " is off-limits, even when you are certain it is correct.\n"
+    "- Cite the chunk label(s) each period's state rests on via chunk_ids.\n"
+    "\n"
+    "Change entries (ADR-0009 §3, §4, §5):\n"
+    "- Group findings by dimension (e.g. 'Tariff risk', 'Data privacy'). For each"
+    " entry, put the earlier period's stated position in period_a and the later"
+    " period's in period_b, each citing its own chunk label(s).\n"
+    "- Only emit an entry you can cite on BOTH sides — both periods must be"
+    " grounded. If one period's chunks do not address a dimension, do not emit"
+    " that entry; note the coverage gap in explanation instead.\n"
+    "- When both periods state the same thing on a dimension, emit the entry with"
+    " changed=false and both sides cited — 'no change' is a legitimate finding."
+    " Never manufacture a difference to appear useful.\n"
+    "\n"
+    "Factual/structural only (ADR-0009 §6):\n"
+    "- change_description states WHAT differs. Label magnitude factually — for"
+    " numeric changes, absolute and percent as stated in the filings.\n"
+    "- Do NOT rank changes by importance, do NOT judge significance, do NOT frame"
+    " anything as an opportunity or as attractive, and never give investment"
+    " advice (ADR-0007 §3).\n"
+    "\n"
+    "explanation: 1-3 plain-text sentences on retrieval scope and limits only —"
+    " never your reasoning process, drafting notes, or any HTML/markup."
+)
+
+
+class DraftPeriodState(BaseModel):
+    """One period's side of a change entry, as the model emits it: a factual
+    state plus the chunk labels grounding it. No URL, no date — those are
+    stamped from retrieval during resolution."""
+
+    state: str = Field(
+        description=(
+            "What this period's filing states on the dimension — factual,"
+            " grounded in the cited chunks, plain text only."
+        )
+    )
+    chunk_ids: list[str] = Field(default_factory=list)
+
+
+class DraftChangeEntry(BaseModel):
+    dimension: str
+    changed: bool = Field(
+        description=(
+            "false when both periods state the same thing on this dimension —"
+            " a legitimate, first-class finding, not a failure."
+        )
+    )
+    period_a: DraftPeriodState  # earlier period
+    period_b: DraftPeriodState  # later period
+    change_description: str = Field(
+        description=(
+            "Factual statement of what differs between the periods (or that"
+            " nothing does). No significance judgment, no reasoning process,"
+            " no markup."
+        )
+    )
+
+
+class ComparisonDraft(BaseModel):
+    """Model-facing output shape for change detection."""
+
+    entries: list[DraftChangeEntry] = Field(default_factory=list)
+    explanation: str = Field(
+        default="",
+        description=(
+            "Brief plain-text note (1-3 sentences) on what the retrieved chunks"
+            " do and do not cover — retrieval scope and limits only. Never"
+            " include your reasoning process, drafting notes, or self-"
+            "corrections, and never HTML or markup."
+        ),
+    )
+
+
+class PeriodState(BaseModel):
+    """One period's side of a resolved change entry. period_end_date and
+    source_url are stamped from the retrieved chunks and filings table
+    (ADR-0009 §3) — never taken from model output."""
+
+    state: str
+    period_end_date: date
+    source_url: str
+
+
+class ChangeEntry(BaseModel):
+    dimension: str
+    changed: bool  # False = "no change on this dimension", both periods cited
+    period_a: PeriodState  # earlier period
+    period_b: PeriodState  # later period
+    change_description: str
+
+
+@dataclass(frozen=True)
+class ComparisonResult:
+    period_comparison: list[ChangeEntry]
+    citations: dict[str, ChunkMatch]  # chunk label -> retrieved chunk
+    warnings: list[QaWarning]  # first-class; never swallowed
+    explanation: str
+
+
+class ComparisonAnswerer(Protocol):
+    def compare(
+        self, question: str, chunks: dict[str, ChunkMatch], periods: Mapping[int, date]
+    ) -> ComparisonDraft: ...
+
+
+def build_comparison_prompt(
+    question: str, chunks: dict[str, ChunkMatch], periods: Mapping[int, date]
+) -> str:
+    rendered = "\n\n".join(
+        f'<chunk label="{label}" ticker="{match.ticker}" section="{match.section}"'
+        f' period_end_date="{periods[match.filing_id].isoformat()}"'
+        f' source_url="{match.source_url}">\n{match.content}\n</chunk>'
+        for label, match in chunks.items()
+    )
+    return (
+        f"Question: {question}\n\n"
+        f"Evidence chunks across periods (the ONLY material you may use):\n\n{rendered}"
+    )
+
+
+def _resolve_side(
+    dimension: str,
+    side: DraftPeriodState,
+    retrieved: dict[str, ChunkMatch],
+    periods: Mapping[int, date],
+) -> tuple[tuple[int, PeriodState] | None, list[QaWarning]]:
+    """Stamp one period side from its citations, or explain why it can't be."""
+    if not side.chunk_ids:
+        return None, [
+            QaWarning(
+                kind="missing_period_citation",
+                message=(
+                    f"change entry {dimension!r} has a period side with no citation;"
+                    " a comparison must cite both periods (ADR-0009 §4)"
+                ),
+            )
+        ]
+    unknown = [cid for cid in side.chunk_ids if cid not in retrieved]
+    if unknown:
+        return None, [
+            QaWarning(
+                kind="unknown_citation",
+                message=(
+                    f"change entry {dimension!r} cites {', '.join(unknown)}, which"
+                    " is not in the retrieved set"
+                ),
+            )
+        ]
+    filing_ids = {retrieved[cid].filing_id for cid in side.chunk_ids}
+    if len(filing_ids) != 1:
+        return None, [
+            QaWarning(
+                kind="missing_period_citation",
+                message=(
+                    f"change entry {dimension!r} cites chunks from multiple periods"
+                    " on one side; each side must ground exactly one period"
+                ),
+            )
+        ]
+    (filing_id,) = filing_ids
+    if filing_id not in periods:
+        return None, [
+            QaWarning(
+                kind="missing_period_citation",
+                message=(f"change entry {dimension!r} cites a filing outside the compared set"),
+            )
+        ]
+    source_url = retrieved[side.chunk_ids[0]].source_url
+    return (
+        filing_id,
+        PeriodState(state=side.state, period_end_date=periods[filing_id], source_url=source_url),
+    ), []
+
+
+def resolve_change_entries(
+    draft: ComparisonDraft,
+    retrieved: dict[str, ChunkMatch],
+    periods: Mapping[int, date],
+) -> tuple[list[ChangeEntry], list[QaWarning]]:
+    """Mechanical enforcement of ADR-0009 §4 plus the artifact guard.
+
+    An entry that cannot cite both periods is NOT emitted (decision #4) and
+    the drop is surfaced on the warnings channel, never silent. Leaked-
+    reasoning artifacts in the free-text fields are flagged but the entry
+    survives — same flag-not-strip posture as verify_answer.
+    """
+    entries: list[ChangeEntry] = []
+    warnings: list[QaWarning] = []
+    warnings.extend(_artifact_warnings("explanation", draft.explanation))
+    for entry in draft.entries:
+        for field_name, value in (
+            ("change_description", entry.change_description),
+            ("period_a state", entry.period_a.state),
+            ("period_b state", entry.period_b.state),
+        ):
+            warnings.extend(_artifact_warnings(f"change entry {field_name}", value))
+        resolved_a, side_warnings = _resolve_side(
+            entry.dimension, entry.period_a, retrieved, periods
+        )
+        warnings.extend(side_warnings)
+        resolved_b, side_warnings = _resolve_side(
+            entry.dimension, entry.period_b, retrieved, periods
+        )
+        warnings.extend(side_warnings)
+        if resolved_a is None or resolved_b is None:
+            continue
+        (filing_a, state_a), (filing_b, state_b) = resolved_a, resolved_b
+        if filing_a == filing_b:
+            warnings.append(
+                QaWarning(
+                    kind="missing_period_citation",
+                    message=(
+                        f"change entry {entry.dimension!r} cites the same period on"
+                        " both sides; a comparison must cite two periods"
+                        " (ADR-0009 §4)"
+                    ),
+                )
+            )
+            continue
+        if state_a.period_end_date > state_b.period_end_date:
+            # period_a is defined as the earlier period; each state keeps the
+            # citations that ground it, only the slot assignment flips.
+            state_a, state_b = state_b, state_a
+        entries.append(
+            ChangeEntry(
+                dimension=entry.dimension,
+                changed=entry.changed,
+                period_a=state_a,
+                period_b=state_b,
+                change_description=entry.change_description,
+            )
+        )
+    return entries, warnings
+
+
+def detect_changes(
+    engine: Engine,
+    embedder: Embedder,
+    answerer: ComparisonAnswerer,
+    question: str,
+    filing_ids: Sequence[int],
+    limit: int = 8,
+) -> ComparisonResult:
+    """THE change-detection function (ADR-0009 decision #1). If a future ADR
+    adds persistence for alerting/briefing, the store caches this function's
+    output — one definition of a change in the system."""
+    if not question.strip():
+        raise ValueError("question must not be blank")
+    unique_ids = list(dict.fromkeys(filing_ids))
+    if len(unique_ids) < 2:
+        raise ValueError("change detection needs at least two filings to compare")
+    matches = balanced_semantic_search(engine, embedder, question, unique_ids, limit)
+    if not matches:
+        return ComparisonResult(
+            period_comparison=[],
+            citations={},
+            warnings=[],
+            explanation="No relevant chunks were retrieved for this comparison.",
+        )
+    with engine.connect() as conn:
+        periods = {
+            p.filing_id: p.period_end_date for p in Repository(conn).filing_periods(unique_ids)
+        }
+    chunks = {f"C{i}": match for i, match in enumerate(matches, start=1)}
+    try:
+        draft = answerer.compare(question, chunks, periods)
+    except anthropic.APIError as exc:
+        raise QaError(f"anthropic: {exc}") from exc
+    entries, warnings = resolve_change_entries(draft, chunks, periods)
+    return ComparisonResult(
+        period_comparison=entries,
+        citations=chunks,
+        warnings=warnings,
+        explanation=draft.explanation,
+    )
 
 
 def _print_claims(title: str, claims: list[Claim]) -> None:

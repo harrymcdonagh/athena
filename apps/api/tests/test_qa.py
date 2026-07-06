@@ -7,7 +7,8 @@ they cannot verify that the live model obeys the ADR-0007 policy — that
 evaluation is future enforcement work per the ADR's Consequences.
 """
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from datetime import date
 from types import SimpleNamespace
 from typing import cast
 
@@ -23,10 +24,16 @@ from apps.api.research.embeddings import Embedder
 from apps.api.research.qa import (
     Claim,
     ClaudeQaAnswerer,
+    ComparisonDraft,
+    DraftChangeEntry,
+    DraftPeriodState,
     QaAnswer,
     QaError,
     answer_question,
+    build_comparison_prompt,
     build_qa_prompt,
+    detect_changes,
+    resolve_change_entries,
     verify_answer,
 )
 from apps.api.research.repository import ChunkMatch
@@ -35,6 +42,8 @@ from apps.api.tests.test_embeddings import (
     axis_vector,
     seed_axis_chunks,
     seed_filing,
+    seed_prior_period_filing,
+    seed_vector_chunks,
 )
 
 # answer_question only touches these through semantic_search; tests that stub
@@ -373,11 +382,278 @@ def test_answer_question_reuses_semantic_search_and_resolves_citations(db: Engin
     assert result.warnings == []
 
 
+# --- change detection: period_comparison (ADR-0009 §3/§4/§5) ---
+
+NEWER_FILING = 1
+OLDER_FILING = 5
+NEW_URL = "https://sec.gov/new-10k.htm"
+OLD_URL = "https://sec.gov/old-10k.htm"
+PERIODS = {NEWER_FILING: date(2025, 9, 27), OLDER_FILING: date(2024, 9, 28)}
+
+
+def chunk_for(filing_id: int, index: int, url: str) -> ChunkMatch:
+    return ChunkMatch(
+        ticker="AAPL",
+        filing_id=filing_id,
+        section="risk_factors",
+        chunk_index=index,
+        content=f"filing {filing_id} risk fact {index}.",
+        source_url=url,
+        distance=0.1,
+    )
+
+
+COMPARISON_RETRIEVED = {
+    "C1": chunk_for(OLDER_FILING, 0, OLD_URL),
+    "C2": chunk_for(OLDER_FILING, 1, OLD_URL),
+    "C3": chunk_for(NEWER_FILING, 0, NEW_URL),
+    "C4": chunk_for(NEWER_FILING, 1, NEW_URL),
+}
+
+
+def draft_entry(
+    *,
+    dimension: str = "Tariff risk",
+    changed: bool = True,
+    a_state: str = "No tariff-specific factor in the gross margin pressure list.",
+    a_chunks: list[str] | None = None,
+    b_state: str = "Adds tariffs and trade restrictions to the margin pressure list.",
+    b_chunks: list[str] | None = None,
+    change_description: str = "The later filing adds a tariff-specific risk factor.",
+) -> DraftChangeEntry:
+    return DraftChangeEntry(
+        dimension=dimension,
+        changed=changed,
+        period_a=DraftPeriodState(
+            state=a_state, chunk_ids=a_chunks if a_chunks is not None else ["C1"]
+        ),
+        period_b=DraftPeriodState(
+            state=b_state, chunk_ids=b_chunks if b_chunks is not None else ["C3"]
+        ),
+        change_description=change_description,
+    )
+
+
+class FakeComparisonAnswerer:
+    def __init__(self, draft: ComparisonDraft) -> None:
+        self._draft = draft
+        self.calls: list[tuple[str, dict[str, ChunkMatch]]] = []
+
+    def compare(
+        self, question: str, chunks: dict[str, ChunkMatch], periods: Mapping[int, date]
+    ) -> ComparisonDraft:
+        self.calls.append((question, chunks))
+        return self._draft
+
+
+def test_qa_answer_schema_is_untouched_by_change_detection() -> None:
+    # ADR-0009 is ADDITIVE: period_comparison lives on a separate comparison
+    # result, NOT on QaAnswer — the flag-off ADR-0007 path keeps its exact
+    # schema, including what_changed as list[Claim].
+    assert set(QaAnswer.model_fields) == {
+        "mode",
+        "claims",
+        "bull",
+        "bear",
+        "what_changed",
+        "verdict_note",
+        "explanation",
+    }
+    assert QaAnswer.model_fields["what_changed"].annotation == list[Claim]
+
+
+def test_resolve_stamps_period_dates_and_urls_from_retrieval() -> None:
+    draft = ComparisonDraft(entries=[draft_entry()])
+    entries, warnings = resolve_change_entries(draft, COMPARISON_RETRIEVED, PERIODS)
+    assert warnings == []
+    (entry,) = entries
+    assert entry.period_a.period_end_date == PERIODS[OLDER_FILING]
+    assert entry.period_a.source_url == OLD_URL
+    assert entry.period_b.period_end_date == PERIODS[NEWER_FILING]
+    assert entry.period_b.source_url == NEW_URL
+    assert entry.changed is True
+
+
+def test_resolve_orders_periods_by_date_not_model_labeling() -> None:
+    # The model put the NEWER period in the period_a slot; resolution must
+    # reorder so period_a is the earlier period, keeping each state with the
+    # chunks that ground it.
+    draft = ComparisonDraft(
+        entries=[
+            draft_entry(
+                a_state="newer state", a_chunks=["C3"], b_state="older state", b_chunks=["C1"]
+            )
+        ]
+    )
+    entries, warnings = resolve_change_entries(draft, COMPARISON_RETRIEVED, PERIODS)
+    assert warnings == []
+    (entry,) = entries
+    assert entry.period_a.state == "older state"
+    assert entry.period_a.period_end_date == PERIODS[OLDER_FILING]
+    assert entry.period_b.state == "newer state"
+    assert entry.period_b.period_end_date == PERIODS[NEWER_FILING]
+
+
+def test_entry_missing_one_periods_citation_is_dropped_with_warning() -> None:
+    draft = ComparisonDraft(entries=[draft_entry(b_chunks=[])])
+    entries, warnings = resolve_change_entries(draft, COMPARISON_RETRIEVED, PERIODS)
+    assert entries == []  # decision #4: not emitted without both periods cited
+    assert [w.kind for w in warnings] == ["missing_period_citation"]
+    assert "Tariff risk" in warnings[0].message
+
+
+def test_entry_citing_same_period_on_both_sides_is_dropped_with_warning() -> None:
+    draft = ComparisonDraft(entries=[draft_entry(a_chunks=["C1"], b_chunks=["C2"])])
+    entries, warnings = resolve_change_entries(draft, COMPARISON_RETRIEVED, PERIODS)
+    assert entries == []
+    assert [w.kind for w in warnings] == ["missing_period_citation"]
+
+
+def test_entry_with_unknown_citation_is_dropped_with_warning() -> None:
+    # The model cannot emit URLs or dates at all (the draft schema has no such
+    # fields); an invented chunk label is the only fabrication surface left.
+    draft = ComparisonDraft(entries=[draft_entry(b_chunks=["C99"])])
+    entries, warnings = resolve_change_entries(draft, COMPARISON_RETRIEVED, PERIODS)
+    assert entries == []
+    assert [w.kind for w in warnings] == ["unknown_citation"]
+    assert "C99" in warnings[0].message
+
+
+def test_no_change_entry_is_first_class() -> None:
+    draft = ComparisonDraft(
+        entries=[
+            draft_entry(
+                changed=False,
+                a_state="Supply chain concentration named as a risk.",
+                b_state="Supply chain concentration named as a risk.",
+                change_description="Both filings state the same supply chain risk.",
+            )
+        ]
+    )
+    entries, warnings = resolve_change_entries(draft, COMPARISON_RETRIEVED, PERIODS)
+    assert warnings == []
+    (entry,) = entries
+    # Distinguishable from an empty result: a populated entry with changed=False
+    # and BOTH periods cited — "we looked, the filings say the same thing."
+    assert entry.changed is False
+    assert entry.period_a.source_url == OLD_URL
+    assert entry.period_b.source_url == NEW_URL
+
+
+def test_artifact_in_change_description_is_flagged_not_dropped() -> None:
+    draft = ComparisonDraft(
+        entries=[draft_entry(change_description="The tariff factor is new.<br>No change needed.")]
+    )
+    entries, warnings = resolve_change_entries(draft, COMPARISON_RETRIEVED, PERIODS)
+    assert len(entries) == 1  # flag-not-strip: the entry survives, visibly warned
+    assert {w.kind for w in warnings} == {"reasoning_artifact"}
+    assert "change_description" in warnings[0].message
+
+
+def test_artifact_in_period_state_is_flagged() -> None:
+    draft = ComparisonDraft(
+        entries=[draft_entry(a_state="Let me reconsider — the list omits tariffs.")]
+    )
+    entries, warnings = resolve_change_entries(draft, COMPARISON_RETRIEVED, PERIODS)
+    assert len(entries) == 1
+    assert {w.kind for w in warnings} == {"reasoning_artifact"}
+
+
+def test_artifact_in_draft_explanation_is_flagged() -> None:
+    draft = ComparisonDraft(entries=[draft_entry()], explanation="Scope note.<br>")
+    _, warnings = resolve_change_entries(draft, COMPARISON_RETRIEVED, PERIODS)
+    assert {w.kind for w in warnings} == {"reasoning_artifact"}
+
+
+def test_detect_changes_end_to_end_resolves_against_real_periods(db: Engine) -> None:
+    newer = seed_filing(db)
+    older = seed_prior_period_filing(db)
+    seed_vector_chunks(
+        db, newer, [axis_vector(0), axis_vector(1)], source_url="https://sec.gov/filing.htm"
+    )
+    seed_vector_chunks(
+        db, older, [axis_vector(0), axis_vector(1)], source_url="https://sec.gov/old-10k.htm"
+    )
+    # Balanced retrieval labels newest-first: C1/C2 newer, C3/C4 older.
+    answerer = FakeComparisonAnswerer(
+        ComparisonDraft(entries=[draft_entry(a_chunks=["C3"], b_chunks=["C1"])])
+    )
+
+    result = detect_changes(
+        db, QueryOnlyEmbedder(axis_vector(0)), answerer, "how did risks change?", [older, newer]
+    )
+
+    assert len(result.period_comparison) == 1
+    entry = result.period_comparison[0]
+    assert entry.period_a.period_end_date == date(2024, 9, 28)  # stamped from the DB
+    assert entry.period_b.period_end_date == date(2025, 9, 27)
+    assert entry.period_a.source_url == "https://sec.gov/old-10k.htm"
+    assert result.warnings == []
+    # Retrieval was balanced: citations span both filings, 2 chunks each.
+    cited_filings = [m.filing_id for m in result.citations.values()]
+    assert cited_filings.count(newer) == 2 and cited_filings.count(older) == 2
+    # The answerer saw exactly the retrieved chunks — no injected context.
+    (call,) = answerer.calls
+    assert call[0] == "how did risks change?"
+    assert set(call[1]) == set(result.citations)
+
+
+def test_detect_changes_empty_retrieval_short_circuits(db: Engine) -> None:
+    newer = seed_filing(db)
+    older = seed_prior_period_filing(db)  # no chunks seeded for either filing
+    answerer = FakeComparisonAnswerer(ComparisonDraft(entries=[draft_entry()]))
+
+    result = detect_changes(
+        db, QueryOnlyEmbedder(axis_vector(0)), answerer, "how did risks change?", [older, newer]
+    )
+
+    assert result.period_comparison == []
+    assert result.citations == {}
+    assert answerer.calls == []  # no model call on empty evidence
+
+
+def test_detect_changes_requires_two_filings() -> None:
+    answerer = FakeComparisonAnswerer(ComparisonDraft())
+    with pytest.raises(ValueError, match="two"):
+        detect_changes(ENGINE, EMBEDDER, answerer, "what changed?", [1])
+
+
+def test_detect_changes_blank_question_raises() -> None:
+    answerer = FakeComparisonAnswerer(ComparisonDraft())
+    with pytest.raises(ValueError, match="question"):
+        detect_changes(ENGINE, EMBEDDER, answerer, "   ", [1, 2])
+
+
+def test_claude_compare_sends_comparison_policy_and_chunks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    draft = ComparisonDraft(entries=[draft_entry()])
+    answerer, fake = make_claude_answerer(monkeypatch, draft)
+
+    result = answerer.compare("how did risks change?", COMPARISON_RETRIEVED, PERIODS)
+
+    assert result is draft
+    (kwargs,) = fake.messages.parse_kwargs
+    assert kwargs["output_format"] is ComparisonDraft
+    system = cast(str, kwargs["system"])
+    assert "ONLY" in system  # grounding: supplied chunks only (ADR-0007 §4)
+    assert "both periods" in system  # decision #4: cite both or don't emit
+    assert "changed" in system  # decision #5: no-change is a legitimate outcome
+    assert "rank" in system  # decision #6: no significance ranking
+    messages = cast(list[dict[str, str]], kwargs["messages"])
+    (message,) = messages
+    assert message["content"] == build_comparison_prompt(
+        "how did risks change?", COMPARISON_RETRIEVED, PERIODS
+    )
+    # Chunks are rendered with their real period dates for the model to group by.
+    assert "2024-09-28" in message["content"] and "2025-09-27" in message["content"]
+
+
 # --- ClaudeQaAnswerer (monkeypatched anthropic client, no network) ---
 
 
 class FakeMessages:
-    def __init__(self, answer: QaAnswer | None) -> None:
+    def __init__(self, answer: QaAnswer | ComparisonDraft | None) -> None:
         self._answer = answer
         self.parse_kwargs: list[dict[str, object]] = []
 
@@ -387,12 +663,12 @@ class FakeMessages:
 
 
 class FakeAnthropicClient:
-    def __init__(self, answer: QaAnswer | None) -> None:
+    def __init__(self, answer: QaAnswer | ComparisonDraft | None) -> None:
         self.messages = FakeMessages(answer)
 
 
 def make_claude_answerer(
-    monkeypatch: pytest.MonkeyPatch, answer: QaAnswer | None
+    monkeypatch: pytest.MonkeyPatch, answer: QaAnswer | ComparisonDraft | None
 ) -> tuple[ClaudeQaAnswerer, FakeAnthropicClient]:
     fake = FakeAnthropicClient(answer)
     monkeypatch.setattr(anthropic, "Anthropic", lambda api_key: fake)

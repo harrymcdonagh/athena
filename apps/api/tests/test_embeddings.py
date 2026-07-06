@@ -536,7 +536,12 @@ def seed_prior_period_filing(db: Engine) -> int:
     )
 
 
-def seed_vector_chunks(db: Engine, filing_id: int, vectors: list[list[float]]) -> None:
+def seed_vector_chunks(
+    db: Engine,
+    filing_id: int,
+    vectors: list[list[float]],
+    source_url: str = "https://sec.gov/filing.htm",
+) -> None:
     chunks = [
         EmbeddedChunk(text=f"filing {filing_id} chunk {i}", embedding=vector)
         for i, vector in enumerate(vectors)
@@ -545,7 +550,7 @@ def seed_vector_chunks(db: Engine, filing_id: int, vectors: list[list[float]]) -
         Repository(conn).replace_chunks(
             filing_id,
             "mdna",
-            "https://sec.gov/filing.htm",
+            source_url,
             chunks,
             model="voyage-context-4",
             dimension=1024,

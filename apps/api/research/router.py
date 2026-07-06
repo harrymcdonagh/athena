@@ -106,7 +106,12 @@ class QaRequest(BaseModel):
 
 
 class QaWarningResponse(BaseModel):
-    kind: Literal["uncited_claim", "unknown_citation", "reasoning_artifact"]
+    # Mirrors QaWarning.kind. missing_period_citation is emitted only by the
+    # (not yet endpoint-wired) change-detection path; listing it here keeps the
+    # HTTP mirror in lockstep with the shared warning type.
+    kind: Literal[
+        "uncited_claim", "unknown_citation", "reasoning_artifact", "missing_period_citation"
+    ]
     message: str
 
 
