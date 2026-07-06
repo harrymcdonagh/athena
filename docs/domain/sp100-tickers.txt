@@ -26,7 +26,7 @@ AVGO
 AXP
 BA
 BAC
-BK
+BNY    # Bank of New York Mellon — ticker changed from BK (caught unresolved by the SEC reference, 2026-07-06)
 BKNG
 BLK
 BMY
