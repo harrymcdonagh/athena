@@ -19,16 +19,18 @@ from pathlib import Path
 from typing import Literal
 
 import httpx2 as httpx
-from sqlalchemy import create_engine
+from sqlalchemy import Engine, create_engine
 
 from apps.api.config import get_settings
 from apps.api.edgar.client import (
+    CompanyRef,
     EdgarClient,
     EdgarError,
     FilingNotFoundError,
     TickerNotFoundError,
 )
 from apps.api.edgar.sections import SectionExtractionError
+from apps.api.research.repository import Repository
 from apps.api.research.service import ResearchService
 from apps.api.research.summarizer import ClaudeSummarizer
 
@@ -36,7 +38,21 @@ TICKER_LIST_PATH = Path(__file__).resolve().parents[3] / "docs/domain/sp100-tick
 
 _logger = logging.getLogger(__name__)
 
-FailureCategory = Literal["not_found", "parse_error", "rate_limited", "other"]
+# `unresolved` ("not in the SEC-resolvable universe — a bad curated-list entry")
+# is deliberately distinct from `not_found` ("EDGAR had no 10-K for a real
+# company"): the first is fixed by editing the list, the second by accepting
+# the company has nothing to ingest.
+FailureCategory = Literal["unresolved", "not_found", "parse_error", "rate_limited", "other"]
+
+
+class ReferenceNotPopulatedError(Exception):
+    def __init__(self) -> None:
+        super().__init__(
+            "sec_ticker_reference is empty — run"
+            " `python -m apps.api.research.ticker_reference` to download the SEC"
+            " mapping before batch ingestion. An empty reference is an operator"
+            " error, not a list of bad symbols."
+        )
 
 
 @dataclass(frozen=True)
@@ -111,23 +127,55 @@ def run_batch(
     service: ResearchService,
     tickers: Sequence[str],
     *,
+    engine: Engine,
     delay_seconds: float = 0.0,
     sleep: Callable[[float], None] = time.sleep,
 ) -> BatchReport:
     """Run the existing single-ticker ingestion for each ticker, skip-and-continue
     on failure, and account for every ticker in the returned report.
 
-    A skipped ticker still made its EDGAR lookups before the stored check, so
-    the politeness delay applies between every pair of companies regardless of
-    the previous outcome (SEC fair-access; there is no other rate limiting in
-    the EDGAR client).
+    The whole list is validated against sec_ticker_reference UP FRONT
+    (ADR-0010 #5): a symbol not in the reference is reported `unresolved` and
+    never attempted against EDGAR, so the list's validity is known before any
+    EDGAR/summarization time is spent. Resolved symbols are ingested under the
+    reference's identity (ADR-0010 #3) — resolution alone still creates no
+    companies row; only successful ingestion does.
+
+    A skipped ticker still made its EDGAR lookup before the stored check, so
+    the politeness delay applies between every pair of EDGAR-contacting
+    tickers regardless of outcome (SEC fair-access; there is no other rate
+    limiting in the EDGAR client). Unresolved symbols contact nothing and get
+    no delay.
     """
+    with engine.connect() as conn:
+        repo = Repository(conn)
+        if repo.ticker_reference_count() == 0:
+            raise ReferenceNotPopulatedError()
+        references = {ticker: repo.resolve_ticker_from_reference(ticker) for ticker in tickers}
     results: list[TickerResult] = []
-    for i, ticker in enumerate(tickers):
-        if i and delay_seconds > 0:
+    contacted_edgar = False
+    for ticker in tickers:
+        reference = references[ticker]
+        if reference is None:
+            reason = (
+                "not in sec_ticker_reference (the SEC-resolvable universe);"
+                " fix the curated list entry or refresh the reference"
+            )
+            _logger.warning("%s failed (unresolved): %s", ticker, reason)
+            results.append(
+                TickerResult(ticker=ticker, status="failed", category="unresolved", reason=reason)
+            )
+            continue
+        if contacted_edgar and delay_seconds > 0:
             sleep(delay_seconds)
+        contacted_edgar = True
+        # exchange stays in the reference table for now: companies has no
+        # exchange column, and adding one is schema work outside this increment.
+        company = CompanyRef(
+            ticker=reference.ticker, cik=reference.cik, name=reference.company_name
+        )
         try:
-            outcome = service.run(ticker)
+            outcome = service.run(ticker, company=company)
         except Exception as exc:
             category = _categorize(exc)
             reason = f"{type(exc).__name__}: {exc}"
@@ -168,12 +216,18 @@ def main() -> None:
     if not settings.anthropic_api_key:
         raise SystemExit("ANTHROPIC_API_KEY is not set; aborting without ingesting anything.")
     tickers = parse_ticker_list(TICKER_LIST_PATH.read_text(encoding="utf-8"))
+    engine = create_engine(settings.database_url)
     service = ResearchService(
         edgar=EdgarClient(user_agent=settings.sec_edgar_user_agent),
         summarizer=ClaudeSummarizer(api_key=settings.anthropic_api_key),
-        engine=create_engine(settings.database_url),
+        engine=engine,
     )
-    report = run_batch(service, tickers, delay_seconds=settings.edgar_batch_delay_seconds)
+    try:
+        report = run_batch(
+            service, tickers, engine=engine, delay_seconds=settings.edgar_batch_delay_seconds
+        )
+    except ReferenceNotPopulatedError as exc:
+        raise SystemExit(str(exc)) from exc
     print(format_report(report))
     print("reminder: run `python -m apps.api.research.embeddings` to embed new sections")
     if report.failures:

@@ -9,6 +9,7 @@ from sqlalchemy import Engine, text
 from sqlalchemy.exc import DBAPIError
 
 from apps.api.edgar.client import EdgarClient, EdgarError, TickerReferenceRow
+from apps.api.research.repository import Repository, TickerReference
 from apps.api.research.ticker_reference import refresh
 from apps.api.tests.conftest import TEST_DATABASE_URL
 from apps.api.tests.test_edgar_client import make_client
@@ -214,6 +215,26 @@ def test_malformed_payload_is_a_hard_error_and_writes_nothing(db: Engine, payloa
     with pytest.raises(EdgarError, match="unexpected EDGAR response shape"):
         refresh(db, client.fetch_ticker_reference)
     assert all_rows(db) == {}  # no silent partial load
+
+
+def test_resolver_returns_reference_identity_case_insensitively(db: Engine) -> None:
+    refresh(db, lambda: [AAPL, BRK_B])
+    with db.connect() as conn:
+        repo = Repository(conn)
+        assert repo.resolve_ticker_from_reference("aapl") == TickerReference(
+            ticker="AAPL", cik="0000320193", company_name="Apple Inc.", exchange="Nasdaq"
+        )
+        assert repo.resolve_ticker_from_reference("BRK-B") == TickerReference(
+            ticker="BRK-B", cik="0001067983", company_name="BERKSHIRE HATHAWAY INC", exchange=None
+        )
+
+
+def test_resolver_returns_none_for_unknown_ticker(db: Engine) -> None:
+    refresh(db, lambda: [AAPL])
+    with db.connect() as conn:
+        repo = Repository(conn)
+        assert repo.resolve_ticker_from_reference("ZZZZ") is None
+        assert repo.ticker_reference_count() == 1
 
 
 def test_refresh_writes_only_the_reference_table(db: Engine) -> None:

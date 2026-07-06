@@ -78,9 +78,20 @@ class ResearchService:
         self._summarizer = summarizer
         self._engine = engine
 
-    def run(self, ticker: str, accession_number: str | None = None) -> ResearchOutcome:
+    def run(
+        self,
+        ticker: str,
+        accession_number: str | None = None,
+        *,
+        company: CompanyRef | None = None,
+    ) -> ResearchOutcome:
+        # `company` carries identity already resolved from sec_ticker_reference
+        # (ADR-0010 #3: reference informs ingestion) — batch passes it so
+        # companies is populated with the reference's CIK/conformed name.
+        # Without it, resolve_ticker is the existing single-ticker fallback.
         try:
-            company = self._edgar.resolve_ticker(ticker)
+            if company is None:
+                company = self._edgar.resolve_ticker(ticker)
             if accession_number is None:
                 filing = self._edgar.latest_10k(company)
             else:

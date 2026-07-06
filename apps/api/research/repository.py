@@ -54,6 +54,16 @@ class FilingPeriod:
 
 
 @dataclass(frozen=True)
+class TickerReference:
+    """One identity row from the sec_ticker_reference external cache (ADR-0010)."""
+
+    ticker: str
+    cik: str
+    company_name: str
+    exchange: str | None
+
+
+@dataclass(frozen=True)
 class ResearchView:
     ticker: str
     company_name: str
@@ -327,6 +337,36 @@ class Repository:
             )
             for row in rows
         ]
+
+    def resolve_ticker_from_reference(self, ticker: str) -> TickerReference | None:
+        """Identity (CIK, conformed name, exchange) from the sec_ticker_reference
+        external cache — the authoritative resolver (ADR-0010 #1).
+
+        Read-only against reference data, never evidence: resolving creates no
+        companies row (ADR-0010 #2 corollary). The table stores uppercased
+        tickers, so lookup uppercases. Unknown ticker → None; the caller
+        decides whether that is an error."""
+        row = self._conn.execute(
+            text(
+                "SELECT ticker, cik, company_name, exchange FROM sec_ticker_reference"
+                " WHERE ticker = :ticker"
+            ),
+            {"ticker": ticker.strip().upper()},
+        ).one_or_none()
+        if row is None:
+            return None
+        return TickerReference(
+            ticker=row.ticker,
+            cik=row.cik,
+            company_name=row.company_name,
+            exchange=row.exchange,
+        )
+
+    def ticker_reference_count(self) -> int:
+        result: int = self._conn.execute(
+            text("SELECT count(*) FROM sec_ticker_reference")
+        ).scalar_one()
+        return result
 
     def insert_thesis_snapshot(self, company_id: int, filing_id: int, content: str) -> int:
         result: int = self._conn.execute(
