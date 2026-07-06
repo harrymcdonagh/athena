@@ -213,6 +213,96 @@ def test_mid_section_cross_reference_does_not_truncate_section() -> None:
     assert "Competition may harm margins" in sections["risk_factors"]
 
 
+def test_pipe_separated_headings_with_running_page_headers() -> None:
+    # The AIG style: headings written "ITEM 1A | Risk Factors" AND repeated as
+    # a running header at the top of every page. The pipe must match, and the
+    # best-bounds pairing must anchor on the FIRST body heading (largest span
+    # to the next section), not the last page header (which would silently
+    # keep only the section's final page).
+    page_header = "AIG | 2025 Form 10-K TABLE OF CONTENTS "
+    toc = (
+        "<p>ITEM 1 Business 2 ITEM 1A Risk Factors 11 ITEM 1B Unresolved Staff Comments 29 "
+        "ITEM 7 Management's Discussion and Analysis 33 ITEM 7A Quantitative and Qualitative "
+        "Disclosures 160</p>"
+    )
+    body = (
+        f"<p>{page_header}ITEM 1 | Business</p><p>{BUSINESS}</p>"
+        f"<p>{page_header}ITEM 1 | Business</p><p>{BUSINESS}</p>"  # second page
+        f"<p>{page_header}ITEM 1A | Risk Factors</p><p>{RISKS}</p>"
+        f"<p>{page_header}ITEM 1A | Risk Factors</p><p>{RISKS}</p>"  # second page
+        "<p>ITEM 1B | Unresolved Staff Comments</p><p>None.</p>"
+        f"<p>{page_header}ITEM 7 | Management's Discussion and Analysis</p><p>{MDNA}</p>"
+        "<p>ITEM 7A | Quantitative and Qualitative Disclosures</p><p>Rates.</p>"
+    )
+    html = f"<html><body>{toc}{body}</body></html>"
+
+    sections = extract_sections(html)
+
+    assert sections["business"].startswith("ITEM 1 | Business")
+    # both pages captured, not just the last one
+    assert sections["business"].count("Revenue was $391,035 million") == 40
+    assert sections["risk_factors"].count("Supply chain concentration") == 40
+    assert "services growth of 13%" in sections["mdna"]
+
+
+def test_part_comma_citations_after_the_body_are_not_headings() -> None:
+    # The ABT/AMGN/AIG batch failures: prose like "see Part I, Item 1A. Risk
+    # Factors" appearing AFTER a section's body. Under last-occurrence
+    # selection these hijacked the start, leaving no end after it. The
+    # "Part <n>," comma form must be recognized as a citation even though
+    # "see" is not directly adjacent, and a trailing "contained in" citation
+    # must be caught too.
+    trailing = (
+        "<p>Additional information is provided in Part I, Item 1A. Risk Factors "
+        "of this report. A discussion of cybersecurity risks is contained in "
+        "Item 1A. Risk Factors under our annual disclosures. "
+        + ("Trailing note context sentence. " * 30)
+        + "</p>"
+    )
+    html = build_10k_html().replace("</body></html>", trailing + "</body></html>")
+
+    sections = extract_sections(html)
+
+    assert sections["risk_factors"].startswith("Item 1A. Risk Factors")
+    assert "Competition may harm margins" in sections["risk_factors"]
+    assert "Trailing note context" not in sections["risk_factors"]
+
+
+def test_unquoted_and_citation_does_not_truncate_section_end() -> None:
+    # The silent-truncation mode found in already-ingested data (ACN, AMD,
+    # BA): an UNQUOTED citation of the next section's heading inside the
+    # current section's body — "...face substantial competition and Item 1A.
+    # Risk Factors—We currently..." — was taken as the section END, storing a
+    # sliver above the length floor with no error. Word-boundary lead-in
+    # filtering on the original text must skip it.
+    post_citation = "Further business detail after the unquoted citation. " * 20
+    business_body = (
+        BUSINESS
+        + "Our candidates face substantial competition and Item 1A. Risk Factors describes "
+        "these pressures further. " + post_citation
+    )
+    toc = (
+        "<p>Item 1. Business ... 3</p><p>Item 1A. Risk Factors ... 20</p>"
+        "<p>Item 1B. Unresolved Staff Comments ... 45</p>"
+        "<p>Item 7. Management's Discussion and Analysis ... 50</p>"
+        "<p>Item 7A. Quantitative and Qualitative Disclosures ... 80</p>"
+    )
+    body = (
+        f"<h2>Item 1. Business</h2><p>{business_body}</p>"
+        f"<h2>Item 1A. Risk Factors</h2><p>{RISKS}</p>"
+        "<h2>Item 1B. Unresolved Staff Comments</h2><p>None.</p>"
+        f"<h2>Item 7. Management's Discussion and Analysis of Financial Condition</h2><p>{MDNA}</p>"
+        "<h2>Item 7A. Quantitative and Qualitative Disclosures About Market Risk</h2><p>Rates.</p>"
+    )
+    html = f"<html><body>{toc}{body}</body></html>"
+
+    sections = extract_sections(html)
+
+    assert "Further business detail after the unquoted citation" in sections["business"]
+    assert sections["risk_factors"].startswith("Item 1A. Risk Factors")
+    assert "Competition may harm margins" in sections["risk_factors"]
+
+
 def test_too_short_section_raises() -> None:
     html = (
         "<html><body><h2>Item 1. Business</h2><p>tiny</p>"
