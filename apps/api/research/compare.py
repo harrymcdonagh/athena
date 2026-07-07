@@ -149,11 +149,14 @@ class Coverage:
 
 @dataclass(frozen=True)
 class ColumnSynthesis:
-    """Outcome of one seam call. `column` carries statements; the two empty
-    outcomes are ADR-0012 #5's split — retrieval_empty is a mechanical fact
-    (no model was consulted), model_declined is an audited model judgment."""
+    """Outcome of one seam call. `column` carries statements; the empty
+    outcomes are ADR-0012 #5's split, three-way per the build review:
+    no_embedded_evidence and below_floor are mechanical facts (the model is
+    never consulted — corpus state and a low-confidence retrieval state,
+    respectively, neither of which is filing silence), while model_declined
+    is an audited model judgment (consulted passages attached)."""
 
-    outcome: Literal["column", "retrieval_empty", "model_declined"]
+    outcome: Literal["column", "no_embedded_evidence", "below_floor", "model_declined"]
     coverage: Coverage
     statements: list[CitedStatement]
     consulted: list[ConsultedPassage]
@@ -173,7 +176,7 @@ class CompareEntry:
     filing: PinnedFiling | None = None  # column / no_finding: what the column speaks for
     statements: list[CitedStatement] = field(default_factory=list)
     coverage: Coverage | None = None
-    no_finding_cause: Literal["retrieval_empty", "model_declined"] | None = None
+    no_finding_cause: Literal["no_embedded_evidence", "below_floor", "model_declined"] | None = None
     consulted_passages: list[ConsultedPassage] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
@@ -217,13 +220,28 @@ def synthesize_column(
             filing_id=filing_id,
             limit=COVERAGE_SCAN_LIMIT,
         )
+    if not scanned:
+        # Corpus state, not filing content: the pinned filing has no embedded
+        # chunks (embeddings backfill pending, or an extraction gap). Calling
+        # this "the filing is silent here" would present corpus state as
+        # filing content — silent wrongness. The model is never consulted.
+        return ColumnSynthesis(
+            outcome="no_embedded_evidence",
+            coverage=Coverage(
+                qualifying=0, consulted=0, scanned=0, floor=QUALIFYING_SIMILARITY_FLOOR
+            ),
+            statements=[],
+            consulted=[],
+            warnings=[],
+        )
     # scanned is best-first by cosine distance, so slicing keeps the best.
     qualifying = [c for c in scanned if 1.0 - c.distance >= QUALIFYING_SIMILARITY_FLOOR]
     if not qualifying:
-        # A mechanical retrieval fact: the model is not consulted, so this
-        # empty column carries no model judgment at all (ADR-0012 #5).
+        # Chunks exist but none cleared the floor: a low-confidence retrieval
+        # state — not filing silence, and not a model judgment (the model is
+        # never consulted). A mechanical fact either way (ADR-0012 #5).
         return ColumnSynthesis(
-            outcome="retrieval_empty",
+            outcome="below_floor",
             coverage=Coverage(
                 qualifying=0,
                 consulted=0,

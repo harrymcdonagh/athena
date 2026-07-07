@@ -486,7 +486,11 @@ def test_coverage_reports_qualifying_vs_consulted(db: Engine) -> None:
     assert len(entry.statements) == 2
 
 
-def test_retrieval_empty_no_finding_never_calls_the_model(db: Engine) -> None:
+def test_below_floor_no_finding_never_calls_the_model(db: Engine) -> None:
+    """Chunks exist but none clear the floor: a low-confidence retrieval
+    state, distinct from both silence-after-consulting (model_declined) and
+    corpus state (no_embedded_evidence) — the three-way split of build
+    review finding #3. Mechanical: no model call."""
     seed_reference(db, "AAPL", "0000320193", "Apple Inc.")
     filing_id = seed_company_filing(
         db, ticker="AAPL", cik="0000320193", name="Apple Inc.", accession="0000320193-25-000001"
@@ -498,11 +502,33 @@ def test_retrieval_empty_no_finding_never_calls_the_model(db: Engine) -> None:
 
     (entry,) = result.entries
     assert entry.kind == "no_finding"
-    assert entry.no_finding_cause == "retrieval_empty"
+    assert entry.no_finding_cause == "below_floor"
     assert entry.coverage is not None
     assert (entry.coverage.qualifying, entry.coverage.consulted) == (0, 0)
     assert entry.coverage.scanned == 2  # chunks existed; none qualified
     assert spy.calls == []  # a mechanical fact needs no model
+
+
+def test_unembedded_filing_is_corpus_state_not_filing_silence(db: Engine) -> None:
+    """A pinned filing with NO embedded chunks (backfill pending, extraction
+    gap) must not masquerade as 'the filing does not address this' — that is
+    corpus state, not filing content (honest-absence, build review finding
+    #3)."""
+    seed_reference(db, "AAPL", "0000320193", "Apple Inc.")
+    seed_company_filing(
+        db, ticker="AAPL", cik="0000320193", name="Apple Inc.", accession="0000320193-25-000001"
+    )
+    # deliberately no seed_chunks: the filing is held but not embedded
+    spy = SpyAnswerer()
+
+    result = compare_companies(db, query_embedder(), spy, ["AAPL"], "tariffs")
+
+    (entry,) = result.entries
+    assert entry.kind == "no_finding"
+    assert entry.no_finding_cause == "no_embedded_evidence"
+    assert entry.coverage is not None
+    assert entry.coverage.scanned == 0  # nothing to scan — the tell
+    assert spy.calls == []
 
 
 def test_model_declined_attaches_consulted_passages_for_audit(db: Engine) -> None:
