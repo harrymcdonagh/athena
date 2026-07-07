@@ -15,6 +15,7 @@ from apps.api.research.embeddings import (
     VoyageEmbedder,
     semantic_search,
 )
+from apps.api.research.find import find_companies
 from apps.api.research.qa import (
     ChangeEntry,
     ClaudeQaAnswerer,
@@ -121,6 +122,33 @@ class SearchResult(BaseModel):
     filing_id: int
     chunk_index: int
     distance: float
+
+
+class FindPassageResponse(BaseModel):
+    snippet: str
+    source_url: str
+    similarity: float
+
+
+class FindCompanyMatchResponse(BaseModel):
+    """One matched company. match_strength is how well the filing TEXT matched
+    the query (best passage's cosine similarity) — a retrieval fact, never a
+    judgment about the company (ADR-0011 §5)."""
+
+    ticker: str
+    company_name: str
+    match_strength: float
+    passages: list[FindPassageResponse]
+
+
+class FindResponse(BaseModel):
+    """HTTP mirror of FindResult (ADR-0011 §1): a retrieval result — matching
+    companies with citing passages — not a generated answer. There is no text
+    field a synthesis or ranking could ride in, and the endpoint takes no
+    answerer dependency: the zero-answer-model contract is structural."""
+
+    query: str
+    matches: list[FindCompanyMatchResponse]
 
 
 class QaRequest(BaseModel):
@@ -292,6 +320,35 @@ def latest_summary(
         filing_url=view.filing_url,
         summaries=view.summaries,
         thesis=view.thesis,
+    )
+
+
+@router.get("/research/find", response_model=FindResponse)
+def find(
+    q: str,
+    engine: Annotated[Engine, Depends(get_read_engine)],
+    embedder: Annotated[Embedder, Depends(get_embedder)],
+) -> FindResponse:
+    # No answerer dependency on purpose (ADR-0011 §1): FIND composes its
+    # result purely from retrieval output. Caps are the find module's
+    # structural constants (ADR-0011 §3) — deliberately not request knobs.
+    try:
+        result = find_companies(engine, embedder, q)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except EmbeddingError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return FindResponse(
+        query=result.query,
+        matches=[
+            FindCompanyMatchResponse(
+                ticker=match.ticker,
+                company_name=match.company_name,
+                match_strength=match.match_strength,
+                passages=[FindPassageResponse(**vars(p)) for p in match.passages],
+            )
+            for match in result.matches
+        ],
     )
 
 

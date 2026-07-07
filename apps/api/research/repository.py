@@ -278,6 +278,20 @@ class Repository:
             for row in rows
         ]
 
+    def company_names(self, tickers: Sequence[str]) -> dict[str, str]:
+        """Display names for the given tickers (FIND grouping, ADR-0011).
+        A lookup, not a search: tickers absent from `companies` are simply
+        absent from the result."""
+        if not tickers:
+            return {}
+        rows = self._conn.execute(
+            text("SELECT ticker, name FROM companies WHERE ticker IN :tickers").bindparams(
+                bindparam("tickers", expanding=True)
+            ),
+            {"tickers": list(tickers)},
+        ).all()
+        return {row.ticker: row.name for row in rows}
+
     def filing_periods(self, filing_ids: Sequence[int]) -> list[FilingPeriod]:
         """The given filings ordered newest-first by the ADR-0008 §1 period
         ordering (period_end_date, then filing_date, then accession_number).

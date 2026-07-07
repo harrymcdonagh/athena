@@ -1,9 +1,11 @@
+import inspect
 from collections.abc import Iterator
 
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import Engine
 
+import apps.api.research.find as find_module
 from apps.api.config import Settings
 from apps.api.edgar.client import CompanyRef, TickerNotFoundError
 from apps.api.main import app
@@ -12,6 +14,9 @@ from apps.api.research.qa import Claim, ComparisonDraft, ComparisonResult, QaAns
 from apps.api.research.repository import Repository
 from apps.api.research.router import (
     ComparisonResponse,
+    FindCompanyMatchResponse,
+    FindPassageResponse,
+    FindResponse,
     QaResponse,
     ResearchResponse,
     get_comparison_answerer,
@@ -20,6 +25,7 @@ from apps.api.research.router import (
     get_read_engine,
     get_research_service,
 )
+from apps.api.research.router import find as find_endpoint
 from apps.api.research.service import ResearchService
 from apps.api.tests.test_embeddings import (
     QueryOnlyEmbedder,
@@ -633,3 +639,84 @@ def test_qa_clamps_limit_to_max(qa_client: TestClient, db: Engine) -> None:
     response = qa_client.post("/research/qa", json={"question": "everything", "limit": 100})
     assert response.status_code == 200
     assert len(response.json()["citations"]) == 25
+
+
+# --- GET /research/find (ADR-0011 §1: FIND mode, zero answer-model) ---
+
+
+def test_find_returns_companies_grouped_with_cited_passages(
+    search_client: TestClient, db: Engine
+) -> None:
+    seed_search_corpus(db)
+    response = search_client.get("/research/find", params={"q": "revenue growth"})
+    assert response.status_code == 200
+    body = response.json()
+    assert set(body) == set(FindResponse.model_fields)
+    assert body["query"] == "revenue growth"
+    # The fake embedder maps every query to axis 0, so AAPL's mdna chunk is the
+    # exact match; both companies have >=1 chunk in the wide results.
+    assert [m["ticker"] for m in body["matches"]] == ["AAPL", "MSFT"]
+    assert body["matches"][0]["company_name"] == "Apple Inc."
+    assert body["matches"][0]["match_strength"] == pytest.approx(1.0, abs=1e-6)
+    for match in body["matches"]:
+        assert set(match) == set(FindCompanyMatchResponse.model_fields)
+        assert match["passages"]
+        for passage in match["passages"]:
+            assert set(passage) == set(FindPassageResponse.model_fields)
+            assert passage["source_url"].startswith("https://www.sec.gov/")
+
+
+def test_find_path_is_structurally_zero_answer_model(search_client: TestClient, db: Engine) -> None:
+    """ADR-0011 §1: the zero-token path is the contract, enforced structurally.
+    The endpoint declares NO answerer dependency (so FastAPI never resolves
+    one — note search_client wires only the engine and embedder, and the
+    request still succeeds) and the find module has nothing answerer-shaped
+    in its namespace to call. A DI spy override cannot test this — an
+    undeclared dependency is never resolved — so the assertion inspects the
+    dependency surface itself."""
+    seed_search_corpus(db)
+
+    response = search_client.get("/research/find", params={"q": "revenue growth"})
+
+    assert response.status_code == 200
+    assert response.json()["matches"]
+    assert set(inspect.signature(find_endpoint).parameters) == {"q", "engine", "embedder"}
+    assert not any("answerer" in name.lower() for name in vars(find_module))
+    assert not any("anthropic" in name.lower() for name in vars(find_module))
+
+
+def test_find_response_cannot_carry_a_ranking_or_synthesis(
+    search_client: TestClient, db: Engine
+) -> None:
+    """ADR-0011 §5: FIND surfaces cited passages ordered by text-match
+    strength. A company ranking or generated characterization is structurally
+    unrepresentable — no response field could carry one."""
+    seed_search_corpus(db)
+    body = search_client.get("/research/find", params={"q": "growth"}).json()
+    forbidden = {"rank", "ranking", "score", "rating", "exposure", "answer", "explanation"}
+    assert forbidden.isdisjoint(FindResponse.model_fields)
+    assert forbidden.isdisjoint(FindCompanyMatchResponse.model_fields)
+    assert forbidden.isdisjoint(FindPassageResponse.model_fields)
+    assert set(body) == set(FindResponse.model_fields)
+
+
+def test_find_empty_corpus_returns_200_with_empty_matches(
+    search_client: TestClient, db: Engine
+) -> None:
+    response = search_client.get("/research/find", params={"q": "tariffs"})
+    assert response.status_code == 200
+    assert response.json() == {"query": "tariffs", "matches": []}
+
+
+def test_find_blank_query_returns_422(search_client: TestClient) -> None:
+    response = search_client.get("/research/find", params={"q": "   "})
+    assert response.status_code == 422
+    assert "blank" in response.json()["detail"]
+
+
+def test_find_embedding_failure_returns_502(search_client: TestClient, db: Engine) -> None:
+    seed_search_corpus(db)
+    app.dependency_overrides[get_embedder] = lambda: ExplodingEmbedder()
+    response = search_client.get("/research/find", params={"q": "growth"})
+    assert response.status_code == 502
+    assert "voyage" in response.json()["detail"]
