@@ -151,6 +151,25 @@ class FindResponse(BaseModel):
     matches: list[FindCompanyMatchResponse]
 
 
+class CompanyListItem(BaseModel):
+    ticker: str
+    company_name: str
+    filing_count: int
+    latest_period_end_date: str
+    # Compare needs two filings (ADR-0009); this tells the picker whether the
+    # compare-across-years toggle is meaningful for the company.
+    has_multiple_filings: bool
+
+
+class CompaniesResponse(BaseModel):
+    """The companies Athena holds ingested evidence for (`companies` table,
+    never sec_ticker_reference — ADR-0010 #2): exactly the set the frontend
+    picker may offer, since a reference-only ticker has nothing to research.
+    Ticker-alphabetical — a plain roster, no judgment-flavored ordering."""
+
+    companies: list[CompanyListItem]
+
+
 class QaRequest(BaseModel):
     question: str
     ticker: str | None = None
@@ -320,6 +339,24 @@ def latest_summary(
         filing_url=view.filing_url,
         summaries=view.summaries,
         thesis=view.thesis,
+    )
+
+
+@router.get("/research/companies", response_model=CompaniesResponse)
+def list_companies(engine: Annotated[Engine, Depends(get_read_engine)]) -> CompaniesResponse:
+    with engine.connect() as conn:
+        listings = Repository(conn).list_companies()
+    return CompaniesResponse(
+        companies=[
+            CompanyListItem(
+                ticker=listing.ticker,
+                company_name=listing.company_name,
+                filing_count=listing.filing_count,
+                latest_period_end_date=listing.latest_period_end_date.isoformat(),
+                has_multiple_filings=listing.filing_count > 1,
+            )
+            for listing in listings
+        ]
     )
 
 

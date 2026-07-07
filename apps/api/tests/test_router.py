@@ -3,7 +3,7 @@ from collections.abc import Iterator
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import Engine
+from sqlalchemy import Engine, text
 
 import apps.api.research.find as find_module
 from apps.api.config import Settings
@@ -13,6 +13,8 @@ from apps.api.research.embeddings import EmbeddedChunk, EmbeddingError
 from apps.api.research.qa import Claim, ComparisonDraft, ComparisonResult, QaAnswer, QaAnswerer
 from apps.api.research.repository import Repository
 from apps.api.research.router import (
+    CompaniesResponse,
+    CompanyListItem,
     ComparisonResponse,
     FindCompanyMatchResponse,
     FindPassageResponse,
@@ -174,6 +176,66 @@ def test_get_summary_after_research(client: TestClient) -> None:
 
 def test_get_summary_unknown_ticker_returns_404(client: TestClient) -> None:
     assert client.get("/companies/ZZZZ/summary").status_code == 404
+
+
+# --- GET /research/companies ---
+
+
+def test_get_companies_lists_ingested_alphabetically_with_aggregates(
+    client: TestClient, db: Engine
+) -> None:
+    # MSFT seeded first to prove ordering is by ticker, not insertion.
+    seed_second_company_filing(db)  # MSFT, one filing (period 2025-09-27)
+    seed_filing(db)  # AAPL, latest period 2025-09-27
+    seed_prior_period_filing(db)  # AAPL, prior period 2024-09-28
+
+    response = client.get("/research/companies")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert set(body) == set(CompaniesResponse.model_fields)
+    aapl, msft = body["companies"]
+    for item in (aapl, msft):
+        assert set(item) == set(CompanyListItem.model_fields)
+    assert aapl == {
+        "ticker": "AAPL",
+        "company_name": "Apple Inc.",
+        "filing_count": 2,
+        "latest_period_end_date": "2025-09-27",
+        "has_multiple_filings": True,
+    }
+    assert msft == {
+        "ticker": "MSFT",
+        "company_name": "Microsoft Corporation",
+        "filing_count": 1,
+        "latest_period_end_date": "2025-09-27",
+        "has_multiple_filings": False,
+    }
+
+
+def test_get_companies_empty_corpus_returns_200_with_empty_list(client: TestClient) -> None:
+    response = client.get("/research/companies")
+    assert response.status_code == 200
+    assert response.json() == {"companies": []}
+
+
+def test_get_companies_excludes_reference_only_tickers(client: TestClient, db: Engine) -> None:
+    """ADR-0010 #2: the picker reflects evidence held (`companies`), never the
+    resolvable universe (sec_ticker_reference). A ticker with a reference row
+    but no ingested filings must not appear."""
+    seed_filing(db)  # AAPL, ingested
+    with db.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO sec_ticker_reference (ticker, cik, company_name, exchange)"
+                " VALUES ('NVDA', '0001045810', 'NVIDIA CORP', 'Nasdaq')"
+            )
+        )
+
+    response = client.get("/research/companies")
+
+    assert response.status_code == 200
+    assert [c["ticker"] for c in response.json()["companies"]] == ["AAPL"]
 
 
 # --- GET /research/search ---

@@ -54,6 +54,16 @@ class FilingPeriod:
 
 
 @dataclass(frozen=True)
+class CompanyListing:
+    """One ingested company with its filing aggregates (roster row)."""
+
+    ticker: str
+    company_name: str
+    filing_count: int
+    latest_period_end_date: date
+
+
+@dataclass(frozen=True)
 class TickerReference:
     """One identity row from the sec_ticker_reference external cache (ADR-0010)."""
 
@@ -291,6 +301,33 @@ class Repository:
             {"tickers": list(tickers)},
         ).all()
         return {row.ticker: row.name for row in rows}
+
+    def list_companies(self) -> list[CompanyListing]:
+        """Every company Athena holds ingested evidence for, with filing count
+        and latest period_end_date, ordered alphabetically by ticker — a plain
+        roster, deliberately not sorted by any metric that implies ranking.
+
+        Reads `companies` (evidence held), never sec_ticker_reference (the
+        resolvable universe) — ADR-0010 #2. The inner join keeps the endpoint's
+        meaning exact: a listed company has at least one ingested filing."""
+        rows = self._conn.execute(
+            text(
+                "SELECT c.ticker, c.name, count(f.id) AS filing_count,"
+                " max(f.period_end_date) AS latest_period_end_date"
+                " FROM companies c JOIN filings f ON f.company_id = c.id"
+                " GROUP BY c.id, c.ticker, c.name"
+                " ORDER BY c.ticker"
+            )
+        ).all()
+        return [
+            CompanyListing(
+                ticker=row.ticker,
+                company_name=row.name,
+                filing_count=row.filing_count,
+                latest_period_end_date=row.latest_period_end_date,
+            )
+            for row in rows
+        ]
 
     def filing_periods(self, filing_ids: Sequence[int]) -> list[FilingPeriod]:
         """The given filings ordered newest-first by the ADR-0008 §1 period

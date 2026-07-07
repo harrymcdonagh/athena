@@ -141,6 +141,45 @@ def test_filings_for_company_unknown_ticker_returns_empty(db: Engine) -> None:
         assert Repository(conn).filings_for_company("ZZZZ") == []
 
 
+def test_list_companies_aggregates_filings_and_orders_by_ticker(db: Engine) -> None:
+    with db.begin() as conn:
+        repo = Repository(conn)
+        # MSFT inserted first to prove ordering is by ticker, not insertion.
+        msft_id = repo.upsert_company("MSFT", "0000789019", "Microsoft Corporation")
+        repo.insert_filing(
+            msft_id,
+            FilingRef(
+                accession_number="0000789019-25-000001",
+                form_type="10-K",
+                filing_date=date(2025, 7, 30),
+                period_end_date=date(2025, 6, 30),
+                filing_url="https://www.sec.gov/Archives/edgar/data/789019/msft-10k.htm",
+            ),
+            content_sha256="sha-msft",
+        )
+        aapl_id = repo.upsert_company("AAPL", "0000320193", "Apple Inc.")
+        repo.insert_filing(aapl_id, PRIOR_FILING, content_sha256="sha-old")
+        repo.insert_filing(aapl_id, FILING, content_sha256="sha-new")
+
+    with db.connect() as conn:
+        listings = Repository(conn).list_companies()
+
+    assert [(c.ticker, c.company_name) for c in listings] == [
+        ("AAPL", "Apple Inc."),
+        ("MSFT", "Microsoft Corporation"),
+    ]
+    aapl, msft = listings
+    assert aapl.filing_count == 2
+    assert aapl.latest_period_end_date == FILING.period_end_date
+    assert msft.filing_count == 1
+    assert msft.latest_period_end_date == date(2025, 6, 30)
+
+
+def test_list_companies_empty_corpus_returns_empty_list(db: Engine) -> None:
+    with db.connect() as conn:
+        assert Repository(conn).list_companies() == []
+
+
 def test_duplicate_section_summary_rejected(db: Engine) -> None:
     with db.begin() as conn:
         repo = Repository(conn)
