@@ -9,7 +9,7 @@ import apps.api.research.find as find_module
 from apps.api.config import Settings
 from apps.api.edgar.client import CompanyRef, TickerNotFoundError
 from apps.api.main import app
-from apps.api.research.compare import MockColumnAnswerer
+from apps.api.research.compare import QUALIFYING_SIMILARITY_FLOOR, MockColumnAnswerer
 from apps.api.research.embeddings import EmbeddedChunk, EmbeddingError
 from apps.api.research.qa import Claim, ComparisonDraft, ComparisonResult, QaAnswer, QaAnswerer
 from apps.api.research.repository import Repository
@@ -825,7 +825,12 @@ def test_compare_returns_one_ordered_typed_entries_list(
     assert [entry["kind"] for entry in body["entries"]] == ["column", "unresolved"]
     assert [entry["symbol"] for entry in body["entries"]] == ["AAPL", "MISSING"]
     column = body["entries"][0]
-    assert column["coverage"] == {"qualifying": 2, "consulted": 2}
+    assert column["coverage"] == {
+        "qualifying": 2,
+        "consulted": 2,
+        "scanned": 2,
+        "floor": QUALIFYING_SIMILARITY_FLOOR,
+    }
     assert column["filing"]["form_type"] == "10-K"
     for statement in column["statements"]:
         assert statement["source_url"].startswith("https://sec.gov/")

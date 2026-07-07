@@ -182,10 +182,14 @@ class ComparePassageResponse(BaseModel):
 
 class CompareCoverageResponse(BaseModel):
     """Mechanical coverage signal (ADR-0012 #3): a retrieval fact, so a
-    starved column self-reports ('2 of 9') instead of reading as complete."""
+    starved column self-reports ('2 of 9') instead of reading as complete.
+    scanned + floor keep the display floor-legible: "2 of 2" always says how
+    many chunks were read and what threshold defined "qualifying"."""
 
     qualifying: int
     consulted: int
+    scanned: int
+    floor: float
 
 
 class ComparePinnedFilingResponse(BaseModel):

@@ -48,9 +48,16 @@ PASSAGES_PER_COMPANY_COMPARE = 2
 # saturates, `qualifying` is a floor, not an exact count.
 COVERAGE_SCAN_LIMIT = 24
 # Similarity floor a passage must clear to count as qualifying (and to be
-# consulted). Starting constant for live validation, like the cap: HD's
-# genuine tariff match scored 0.2397 in FIND's validation, so the floor sits
-# just under real-but-weak matches.
+# consulted). UNVALIDATED for stage-2 per-filing distributions (build review
+# finding #1): the only calibration datum — HD's genuine tariff match at
+# 0.2397 — came from FIND's stage-1 GLOBAL ranking, a different distribution.
+# The floor sits in the coverage display's denominator and gates the model
+# call, so it is a first-rank live-validate item alongside the passage cap:
+# the k=6-8 omission diff must check whether omitted-material passages score
+# below it, and the specimen set must include a weak-but-real match (the
+# HD-tariff class) to catch a false below-floor "silence". Tuned at the
+# constant only, with before/after evidence, per the live-validation
+# discipline.
 QUALIFYING_SIMILARITY_FLOOR = 0.20
 
 
@@ -126,10 +133,18 @@ class Coverage:
     """Mechanical coverage signal (ADR-0012 #3): a retrieval fact, zero
     answer-model tokens, §5-safe like FIND's match_strength. Converts a
     starved-but-fluent column from invisible under-coverage into
-    self-reporting ("2 of 9 qualifying passages consulted")."""
+    self-reporting ("2 of 9 qualifying passages consulted").
+
+    scanned and floor make the display floor-legible (build review finding
+    #1): "2 of 2 qualifying" cannot silently mean "above an uncalibrated
+    threshold" when the response also says 24 chunks were scanned against a
+    0.20 floor. When scanned == COVERAGE_SCAN_LIMIT the qualifying count is
+    a lower bound, not an exact count."""
 
     qualifying: int  # passages in the pinned filing at/above the floor
     consulted: int  # of those, how many the answer model saw
+    scanned: int  # chunks the coverage scan read from the pinned filing
+    floor: float  # the similarity floor in force (QUALIFYING_SIMILARITY_FLOOR)
 
 
 @dataclass(frozen=True)
@@ -209,7 +224,12 @@ def synthesize_column(
         # empty column carries no model judgment at all (ADR-0012 #5).
         return ColumnSynthesis(
             outcome="retrieval_empty",
-            coverage=Coverage(qualifying=0, consulted=0),
+            coverage=Coverage(
+                qualifying=0,
+                consulted=0,
+                scanned=len(scanned),
+                floor=QUALIFYING_SIMILARITY_FLOOR,
+            ),
             statements=[],
             consulted=[],
             warnings=[],
@@ -220,7 +240,12 @@ def synthesize_column(
             qualifying[: min(passages_per_company, PASSAGES_PER_COMPANY_COMPARE)]
         )
     }
-    coverage = Coverage(qualifying=len(qualifying), consulted=len(labeled))
+    coverage = Coverage(
+        qualifying=len(qualifying),
+        consulted=len(labeled),
+        scanned=len(scanned),
+        floor=QUALIFYING_SIMILARITY_FLOOR,
+    )
     consulted = [
         ConsultedPassage(
             label=label,

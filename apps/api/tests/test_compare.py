@@ -478,6 +478,11 @@ def test_coverage_reports_qualifying_vs_consulted(db: Engine) -> None:
     assert entry.coverage is not None
     assert entry.coverage.qualifying == 3
     assert entry.coverage.consulted == 2  # PASSAGES_PER_COMPANY_COMPARE
+    # Floor-legible display (build review finding #1): the scanned count and
+    # the floor in force ride with the counts, so "2 of 2" can never silently
+    # mean "2 of 2 above an uncalibrated threshold".
+    assert entry.coverage.scanned == 5
+    assert entry.coverage.floor == QUALIFYING_SIMILARITY_FLOOR
     assert len(entry.statements) == 2
 
 
@@ -496,6 +501,7 @@ def test_retrieval_empty_no_finding_never_calls_the_model(db: Engine) -> None:
     assert entry.no_finding_cause == "retrieval_empty"
     assert entry.coverage is not None
     assert (entry.coverage.qualifying, entry.coverage.consulted) == (0, 0)
+    assert entry.coverage.scanned == 2  # chunks existed; none qualified
     assert spy.calls == []  # a mechanical fact needs no model
 
 
