@@ -64,6 +64,31 @@ class TickerReference:
 
 
 @dataclass(frozen=True)
+class RepairCandidate:
+    """One stored filing plus the company identity needed to re-audit it
+    (fetch its document, check content_sha256, recompose a thesis)."""
+
+    filing_id: int
+    company_id: int
+    ticker: str
+    cik: str
+    company_name: str
+    accession_number: str
+    form_type: str
+    filing_date: date
+    period_end_date: date
+    filing_url: str
+    content_sha256: str
+
+
+@dataclass(frozen=True)
+class StoredSummary:
+    summary: str
+    source_text: str
+    source_url: str
+
+
+@dataclass(frozen=True)
 class ResearchView:
     ticker: str
     company_name: str
@@ -367,6 +392,85 @@ class Repository:
             text("SELECT count(*) FROM sec_ticker_reference")
         ).scalar_one()
         return result
+
+    def filings_for_repair_audit(self) -> list[RepairCandidate]:
+        """Every stored filing with its company identity, ticker-ordered.
+
+        The extraction-repair audit walks ALL filings rather than a curated
+        list: corruption is defined by diffing the fixed extractor's output
+        against stored source_text, so the work-list must be computed, never
+        hardcoded (it stays correct after any future extractor change)."""
+        rows = self._conn.execute(
+            text(
+                "SELECT f.id, f.company_id, c.ticker, c.cik, c.name, f.accession_number,"
+                " f.form_type, f.filing_date, f.period_end_date, f.filing_url,"
+                " f.content_sha256"
+                " FROM filings f JOIN companies c ON c.id = f.company_id"
+                " ORDER BY c.ticker, f.accession_number"
+            )
+        ).all()
+        return [
+            RepairCandidate(
+                filing_id=row.id,
+                company_id=row.company_id,
+                ticker=row.ticker,
+                cik=row.cik,
+                company_name=row.name,
+                accession_number=row.accession_number,
+                form_type=row.form_type,
+                filing_date=row.filing_date,
+                period_end_date=row.period_end_date,
+                filing_url=row.filing_url,
+                content_sha256=row.content_sha256,
+            )
+            for row in rows
+        ]
+
+    def stored_summaries(self, filing_id: int) -> dict[str, StoredSummary]:
+        rows = self._conn.execute(
+            text(
+                "SELECT section, summary, source_text, source_url FROM filing_summaries"
+                " WHERE filing_id = :filing_id ORDER BY section"
+            ),
+            {"filing_id": filing_id},
+        ).all()
+        return {
+            row.section: StoredSummary(
+                summary=row.summary, source_text=row.source_text, source_url=row.source_url
+            )
+            for row in rows
+        }
+
+    def update_summary(
+        self, filing_id: int, section: str, *, summary: str, source_text: str, model: str
+    ) -> int:
+        """Repair one summary row in place: new source_text (the fixed
+        extractor's output), new summary, the current summarizer's model.
+        source_url is deliberately not touched — the document is the same one
+        that was ingested (content_sha256-guarded by the caller)."""
+        result = self._conn.execute(
+            text(
+                "UPDATE filing_summaries SET summary = :summary, source_text = :source_text,"
+                " model = :model WHERE filing_id = :filing_id AND section = :section"
+            ),
+            {
+                "summary": summary,
+                "source_text": source_text,
+                "model": model,
+                "filing_id": filing_id,
+                "section": section,
+            },
+        )
+        return result.rowcount
+
+    def delete_chunks(self, filing_id: int, section: str) -> int:
+        """Deleting a section's chunks is what queues it for the existing
+        embeddings backfill (sections_pending_embedding); repair never embeds."""
+        result = self._conn.execute(
+            text("DELETE FROM filing_chunks WHERE filing_id = :filing_id AND section = :section"),
+            {"filing_id": filing_id, "section": section},
+        )
+        return result.rowcount
 
     def insert_thesis_snapshot(self, company_id: int, filing_id: int, content: str) -> int:
         result: int = self._conn.execute(
