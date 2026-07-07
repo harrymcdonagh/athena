@@ -15,7 +15,7 @@ apps/api/            FastAPI backend (Python 3.12+)
 apps/api/research/   Evidence layer: qa, find, compare, batch, embeddings, …
 apps/api/edgar/      SEC EDGAR client + section extraction
 apps/api/migrations/ Alembic revisions (explicit raw SQL, per ADR-0003/0005)
-apps/web/            React + Vite frontend (uncommitted work in progress)
+apps/web/            React + Vite + TS research terminal (committed 12bc1a3)
 packages/            Shared Python packages (future)
 docs/decisions/      ADRs 0001–0012 — read before touching affected code
 docs/domain/         Domain knowledge (curated ticker list)
@@ -85,15 +85,19 @@ python -m apps.api.research.embeddings   # embedding backfill
 
 ## Current state (2026-07-07)
 
-- **Evidence layer complete through ADR-0012's mocked build.** Ingestion →
+- **Evidence layer complete and live through ADR-0012.** Ingestion →
   summaries → embeddings → cited QA (ADR-0007) → temporal corpus (ADR-0008)
   → change detection with balanced per-period retrieval and mandatory
   both-period citation (ADR-0009) → `sec_ticker_reference` as an external SEC
   cache, distinct from `companies` (ADR-0010) → FIND cross-company mode with
-  zero answer-model calls (ADR-0011) → COMPARE mocked build committed
-  (f7c221a): CIK-deduped named set ≤5, refusal at cap, filing-pinned
-  per-column synthesis, coverage counts, `MockColumnAnswerer` pending review
-  and live swap.
+  zero answer-model calls (ADR-0011) → COMPARE live (df8f047, answerer swapped
+  from the f7c221a mock): CIK-deduped named set ≤5, refusal at cap,
+  filing-pinned per-column synthesis, coverage counts, live-validated
+  2026-07-07 (see Pending queue).
+- **Frontend landed** (12bc1a3, 2026-07-07): `apps/web` is a Vite + React + TS
+  research terminal (find / research+compare / passages) over the local API;
+  backend has narrow CORS for the Vite dev origin (e4acb4f). ADR-0002 amended
+  to record Vite-not-Next (f21bc30).
 - **Corpus:** 84 companies / 85 filings / 8,277 chunks (verified against the
   DB 2026-07-07) from a 101-symbol S&P 100 snapshot
   (`docs/domain/sp100-tickers.txt`); 16 filers known-absent (10-Ks that
@@ -102,7 +106,7 @@ python -m apps.api.research.embeddings   # embedding backfill
   ticker diff also shows GOOGL — not absent: it shares Alphabet's CIK with
   GOOG, which is ingested (companies are keyed by CIK).
   Extraction repair f5f39ee re-embedded 13 corrupted filings; corpus clean.
-- **Tests:** ~262 collected and passing (`pytest`).
+- **Tests:** 264 collected and passing (`pytest`, verified 2026-07-07).
 - **Batch ingestion** reports categorized failures (`unresolved`, `not_found`,
   `parse_error`, `rate_limited`, `other`) with the accounting invariant
   ingested + skipped + failed == attempted; section-plausibility warnings are
@@ -124,9 +128,11 @@ python -m apps.api.research.embeddings   # embedding backfill
   ranks 3+).
 - **Push discipline:** commits may accumulate locally; check
   `git log origin/main..HEAD` before assuming origin is current.
-- **Uncommitted:** apps/web React+Vite frontend and the CORS middleware in
-  `apps/api/main.py` — in-progress frontend work; don't sweep it into
-  unrelated commits.
+- **Frontend committed and pushed** (f21bc30 / e4acb4f / 12bc1a3): builds clean
+  under `tsc` strict (`cd apps/web && npm run build`); no eslint config, the
+  strict-TS compile is the gate. Follow-ups if pursued: env-configurable API
+  base is present (`VITE_API_BASE_URL`) but there is no production build/deploy
+  story yet, and no frontend tests.
 - **Backlog:** S&P 500 breadth run (deferred by choice, ADR-0010/0011);
   incorporation-by-reference extractor for the 16 missing filers; content
   dedupe for FIND; cross-encoder reranker (only if precision at the margin
@@ -150,8 +156,9 @@ python -m apps.api.research.embeddings   # embedding backfill
   (`Summarizer`, answerers); tests use deterministic fakes.
 - HTTP: `httpx2` everywhere EXCEPT anthropic-SDK exception handling, which
   needs real `httpx` (see `import httpx2 as httpx` in batch.py).
-- Frontend: ADR-0002 chose Next.js, but the actual scaffold in `apps/web` is
-  React + Vite + TypeScript (uncommitted) — inspect before building on it.
+- Frontend: Vite + React 19 + TypeScript SPA in `apps/web` (committed),
+  `tsc` strict, no UI kit. ADR-0002 originally chose Next.js and was amended
+  2026-07-07 to record the Vite reality (the SSR rationale never materialised).
 
 ## Deeper knowledge
 

@@ -22,7 +22,7 @@ htmlcov/
 .coverage
 coverage.xml
 
-# Node / Next.js
+# Node / web build (apps/web is Vite; dist/ covered above, .next/out kept harmless)
 node_modules/
 .next/
 out/
