@@ -10,9 +10,13 @@ from sqlalchemy import Engine, text
 
 from apps.api.edgar.client import CompanyRef, FilingNotFoundError, FilingRef
 from apps.api.research.service import (
+    PLAUSIBLE_SECTION_MIN_CHARS,
+    PLAUSIBLE_SECTION_MIN_FRACTION,
+    ResearchOutcome,
     ResearchService,
     UnsupportedFilingTypeError,
     UpstreamError,
+    check_section_plausibility,
     compose_thesis,
 )
 
@@ -57,6 +61,24 @@ HTML = (
 )
 
 
+def make_html(business: str, risks: str, mdna: str, padding: str = "") -> str:
+    """The standard fixture layout with controllable section/document sizes.
+    `padding` lands after Item 7A, inflating the document without entering any
+    section — how a real filing's financial statements dwarf its items."""
+    return (
+        "<html><body>"
+        "<p>Item 1. Business ... 3</p><p>Item 1A. Risk Factors ... 20</p>"
+        "<p>Item 1B. Unresolved ... 45</p><p>Item 7. Management's Discussion ... 50</p>"
+        "<p>Item 7A. Quantitative ... 80</p>"
+        f"<h2>Item 1. Business</h2><p>{business}</p>"
+        f"<h2>Item 1A. Risk Factors</h2><p>{risks}</p>"
+        "<h2>Item 1B. Unresolved Staff Comments</h2><p>None.</p>"
+        f"<h2>Item 7. Management's Discussion and Analysis</h2><p>{mdna}</p>"
+        f"<h2>Item 7A. Quantitative and Qualitative Disclosures</h2><p>Rates. {padding}</p>"
+        "</body></html>"
+    )
+
+
 class FakeEdgar:
     def __init__(self, filings: Sequence[FilingRef] = (FILING,)) -> None:
         self._filings = list(filings)  # newest first, like EDGAR's recent window
@@ -80,6 +102,15 @@ class FakeEdgar:
 
     def fetch_document(self, filing: FilingRef) -> str:
         return HTML
+
+
+class FixedDocumentEdgar(FakeEdgar):
+    def __init__(self, html: str, filings: Sequence[FilingRef] = (FILING,)) -> None:
+        super().__init__(filings)
+        self._html = html
+
+    def fetch_document(self, filing: FilingRef) -> str:
+        return self._html
 
 
 class FakeSummarizer:
@@ -246,6 +277,116 @@ def test_anthropic_error_is_wrapped_as_upstream_error(db: Engine) -> None:
     assert count(db, "filings") == 0
     assert count(db, "filing_summaries") == 0
     assert count(db, "thesis_snapshots") == 0
+
+
+# --- section-plausibility guard (flag-not-block) ---
+
+# Fraction-tripping layout: healthy-sized business/risk sections, a small (but
+# above-floor) mdna, and enough padding that mdna is an implausible fraction of
+# the document — the shape of the hijacked-sliver corruption class.
+FRACTION_TRIP_HTML = make_html(
+    business="b" * 30_000, risks="r" * 30_000, mdna="m" * 1_500, padding="p" * 90_000
+)
+# Floor-tripping layout: a small document, so the tiny mdna is a healthy
+# fraction of it but is broken in absolute terms.
+FLOOR_TRIP_HTML = make_html(business="b" * 5_000, risks="r" * 5_000, mdna="m" * 800)
+BOTH_TRIP_HTML = make_html(
+    business="b" * 30_000, risks="r" * 30_000, mdna="m" * 700, padding="p" * 90_000
+)
+# SPG's measured corruption (calibration 2026-07-07): stored risk_factors was
+# 2,179 chars of an ~689k-char document text (0.32%) — the worst real case.
+SPG_SHAPED_HTML = make_html(
+    business="b" * 30_571, risks="r" * 2_179, mdna="m" * 87_294, padding="p" * 560_000
+)
+
+
+def run_with_document(db: Engine, html: str) -> ResearchOutcome:
+    service = ResearchService(
+        edgar=FixedDocumentEdgar(html), summarizer=FakeSummarizer(), engine=db
+    )
+    return service.run("AAPL")
+
+
+def test_low_fraction_section_warns_and_is_still_stored(db: Engine) -> None:
+    outcome = run_with_document(db, FRACTION_TRIP_HTML)
+
+    assert outcome.status == "ingested"
+    assert [w.section for w in outcome.section_warnings] == ["mdna"]
+    warning = outcome.section_warnings[0]
+    assert warning.checks == ("fraction_of_document",)
+    assert warning.fraction < PLAUSIBLE_SECTION_MIN_FRACTION
+    assert warning.section_chars >= PLAUSIBLE_SECTION_MIN_CHARS  # floor did NOT fire
+    # Flag-not-block: the flagged section is stored and summarized normally.
+    assert count(db, "filing_summaries") == 3
+    with db.connect() as conn:
+        stored = conn.execute(
+            text("SELECT source_text FROM filing_summaries WHERE section = 'mdna'")
+        ).scalar_one()
+    assert "m" * 100 in stored
+    assert count(db, "thesis_snapshots") == 1
+
+
+def test_section_under_absolute_floor_warns_and_is_still_stored(db: Engine) -> None:
+    outcome = run_with_document(db, FLOOR_TRIP_HTML)
+
+    assert outcome.status == "ingested"
+    assert [w.section for w in outcome.section_warnings] == ["mdna"]
+    warning = outcome.section_warnings[0]
+    assert warning.checks == ("absolute_floor",)
+    assert warning.fraction >= PLAUSIBLE_SECTION_MIN_FRACTION  # fraction did NOT fire
+    assert count(db, "filing_summaries") == 3
+
+
+def test_healthy_sections_produce_no_warnings(db: Engine) -> None:
+    outcome = run_with_document(db, HTML)  # the standard healthy fixture
+
+    assert outcome.status == "ingested"
+    assert outcome.section_warnings == ()
+
+
+def test_spg_shaped_corruption_fires_the_fraction_check(db: Engine) -> None:
+    # Reconstructs the real signal that went unflagged: had this guard existed,
+    # SPG's hijacked risk_factors would have warned at first ingestion.
+    outcome = run_with_document(db, SPG_SHAPED_HTML)
+
+    assert [w.section for w in outcome.section_warnings] == ["risk_factors"]
+    warning = outcome.section_warnings[0]
+    assert "fraction_of_document" in warning.checks
+    assert warning.fraction == pytest.approx(0.0032, rel=0.2)
+
+
+def test_both_checks_firing_are_both_reported(db: Engine) -> None:
+    outcome = run_with_document(db, BOTH_TRIP_HTML)
+
+    assert [w.section for w in outcome.section_warnings] == ["mdna"]
+    assert outcome.section_warnings[0].checks == ("fraction_of_document", "absolute_floor")
+
+
+def test_plausibility_warning_is_logged_on_single_ticker_ingest(
+    db: Engine, caplog: pytest.LogCaptureFixture
+) -> None:
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="apps.api.research.service"):
+        run_with_document(db, FRACTION_TRIP_HTML)
+
+    assert "AAPL" in caplog.text
+    assert FILING.accession_number in caplog.text
+    assert "mdna" in caplog.text
+    assert "fraction_of_document" in caplog.text
+
+
+def test_plausibility_thresholds_are_exclusive_boundaries() -> None:
+    # A document with no tags or whitespace has a known exact text length.
+    document = "<p>" + "x" * 100_000 + "</p>"
+    at_fraction = "y" * int(100_000 * PLAUSIBLE_SECTION_MIN_FRACTION)
+    at_floor_doc = "<p>" + "x" * 10_000 + "</p>"
+
+    assert check_section_plausibility(document, {"mdna": at_fraction}) == ()
+    assert check_section_plausibility(document, {"mdna": at_fraction[:-1]}) != ()
+    assert check_section_plausibility(at_floor_doc, {"mdna": "y" * 1_000}) == ()
+    floored = check_section_plausibility(at_floor_doc, {"mdna": "y" * 999})
+    assert [w.checks for w in floored] == [("absolute_floor",)]
 
 
 def test_compose_thesis_cites_filing() -> None:

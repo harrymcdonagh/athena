@@ -80,6 +80,17 @@ def get_comparison_answerer() -> ComparisonAnswerer:
     return ClaudeQaAnswerer(api_key=settings.anthropic_api_key)
 
 
+class SectionWarningResponse(BaseModel):
+    """HTTP mirror of SectionPlausibilityWarning — flag-not-block, so it rides
+    on a successful (200, ingested) response like QaResponse.warnings does."""
+
+    section: str
+    section_chars: int
+    document_chars: int
+    fraction: float
+    checks: list[str]
+
+
 class ResearchResponse(BaseModel):
     ticker: str
     status: Literal["ingested", "skipped"]
@@ -89,6 +100,7 @@ class ResearchResponse(BaseModel):
     filing_url: str
     summaries: dict[str, str]
     thesis_snapshot_id: int | None
+    section_warnings: list[SectionWarningResponse] = []
 
 
 class SummaryResponse(BaseModel):
@@ -256,7 +268,12 @@ def run_research(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except (UpstreamError, SummarizationError) as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
-    return ResearchResponse(ticker=ticker.upper(), **vars(outcome))
+    fields = {k: v for k, v in vars(outcome).items() if k != "section_warnings"}
+    return ResearchResponse(
+        ticker=ticker.upper(),
+        **fields,
+        section_warnings=[SectionWarningResponse(**vars(w)) for w in outcome.section_warnings],
+    )
 
 
 @router.get("/companies/{ticker}/summary", response_model=SummaryResponse)

@@ -22,7 +22,7 @@ from apps.api.research.batch import (
 )
 from apps.api.research.service import ResearchService
 from apps.api.research.ticker_reference import refresh
-from apps.api.tests.test_service import HTML, FakeSummarizer, count
+from apps.api.tests.test_service import FRACTION_TRIP_HTML, HTML, FakeSummarizer, count
 
 UNPARSEABLE_HTML = "<html><body><p>No items here at all.</p></body></html>"
 
@@ -71,6 +71,7 @@ class MultiTickerEdgar:
         tickers: list[str],
         unparseable: set[str] | None = None,
         rate_limited: set[str] | None = None,
+        documents: dict[str, str] | None = None,
     ) -> None:
         self._companies = {
             t: CompanyRef(ticker=t, cik=f"{seq:010d}", name=f"{t} Inc.")
@@ -79,6 +80,10 @@ class MultiTickerEdgar:
         self._filings = {t: filing(seq) for seq, t in enumerate(tickers, start=1)}
         self._unparseable = {self._filings[t].accession_number for t in (unparseable or set())}
         self._rate_limited = rate_limited or set()
+        # per-ticker document override (keyed here by accession, like unparseable)
+        self._documents = {
+            self._filings[t].accession_number: html for t, html in (documents or {}).items()
+        }
         self.resolve_calls = 0
 
     def resolve_ticker(self, ticker: str) -> CompanyRef:
@@ -107,7 +112,7 @@ class MultiTickerEdgar:
     def fetch_document(self, filing: FilingRef) -> str:
         if filing.accession_number in self._unparseable:
             return UNPARSEABLE_HTML
-        return HTML
+        return self._documents.get(filing.accession_number, HTML)
 
 
 def make_service(edgar: MultiTickerEdgar, db: Engine) -> ResearchService:
@@ -267,6 +272,37 @@ def test_unresolved_symbols_get_no_politeness_delay(db: Engine) -> None:
     run_batch(service, tickers, engine=db, delay_seconds=0.25, sleep=naps.append)
 
     assert naps == [0.25]
+
+
+def test_section_plausibility_warnings_are_reported_not_failures(db: Engine) -> None:
+    # WARN's document ingests fine but one section is an implausibly small
+    # fraction of it — a warning channel entry, never a failure.
+    tickers = ["AAA", "WARN"]
+    seed_reference(db, tickers)
+    edgar = MultiTickerEdgar(tickers, documents={"WARN": FRACTION_TRIP_HTML})
+    service = make_service(edgar, db)
+
+    report = run_batch(service, tickers, engine=db)
+
+    by_ticker = {r.ticker: r for r in report.results}
+    assert by_ticker["WARN"].status == "ingested"  # flag-not-block: still ingested
+    assert [w.section for w in by_ticker["WARN"].section_warnings] == ["mdna"]
+    assert by_ticker["AAA"].section_warnings == ()
+    assert report.failures == ()  # a warning is NOT a failure
+    # the accounting invariant is untouched by the warning channel
+    assert report.ingested + report.skipped + len(report.failures) == report.attempted == 2
+    assert count(db, "filings") == 2  # both stored, warned one included
+
+    formatted = format_report(report)
+    assert "plausibility" in formatted
+    assert "WARN" in formatted and "mdna" in formatted and "fraction_of_document" in formatted
+
+
+def test_report_without_warnings_has_no_warning_block() -> None:
+    report = BatchReport(
+        results=(TickerResult(ticker="AAA", status="ingested", accession_number="1-25-1"),)
+    )
+    assert "plausibility" not in format_report(report)
 
 
 def test_parse_ticker_list_ignores_comments_and_blank_lines() -> None:

@@ -1,4 +1,5 @@
 import hashlib
+import logging
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
@@ -7,15 +8,85 @@ import httpx2 as httpx
 from sqlalchemy import Engine
 
 from apps.api.edgar.client import CompanyRef, FilingRef
-from apps.api.edgar.sections import extract_sections
+
+# _html_to_text is deliberately the extractor's own converter: the guard's
+# denominator must be the same document text the sections were sliced from.
+# Known cost: extract_sections also parses the HTML internally, so each ingest
+# parses twice; a single parse would need the extractor to expose its text.
+from apps.api.edgar.sections import _html_to_text, extract_sections
 from apps.api.research.repository import Repository
 from apps.api.research.summarizer import Summarizer
+
+_logger = logging.getLogger(__name__)
 
 _SECTION_TITLES = {
     "business": "Business (Item 1)",
     "risk_factors": "Risk Factors (Item 1A)",
     "mdna": "Management's Discussion and Analysis (Item 7)",
 }
+
+# Section-plausibility thresholds, calibrated against the 2026-07-07 extraction
+# repair (85-filing corpus + 24-document fraction measurement). Hijacked-sliver
+# corruption sat at ≤1.11% of document text (SPG risk_factors 0.32%, ACN
+# ≤1.00%, BA 1.11%); the smallest healthy non-stub section was 2.97% (NFLX
+# business). 2% splits the gap conservatively. The floor must exceed the
+# extractor's own 500-char hard minimum to ever fire; 1,000 is still ~9x below
+# the smallest healthy real section observed (9,172 chars).
+PLAUSIBLE_SECTION_MIN_FRACTION = 0.02
+PLAUSIBLE_SECTION_MIN_CHARS = 1_000
+
+PlausibilityCheck = Literal["fraction_of_document", "absolute_floor"]
+
+
+@dataclass(frozen=True)
+class SectionPlausibilityWarning:
+    """One suspiciously-short extracted section, flagged at ingest.
+
+    Flag-not-block: the section is still stored and summarized normally; a
+    false positive costs one report line, never data. Mirrors the QA layer's
+    flag-not-strip posture for reasoning artifacts."""
+
+    section: str
+    section_chars: int
+    document_chars: int  # length of the document's extracted text
+    fraction: float
+    checks: tuple[PlausibilityCheck, ...]
+
+    def describe(self) -> str:
+        return (
+            f"section {self.section!r} is {self.section_chars:,} chars of a"
+            f" {self.document_chars:,}-char document ({self.fraction:.2%});"
+            f" checks: {', '.join(self.checks)}"
+        )
+
+
+def check_section_plausibility(
+    html: str, sections: dict[str, str]
+) -> tuple[SectionPlausibilityWarning, ...]:
+    """Flag extracted sections that are implausibly short — the signature of
+    silent extraction corruption (hijacked slivers, hard truncation). Purely
+    observational: storage and summarization proceed regardless."""
+    document_chars = max(len(_html_to_text(html)), 1)
+    warnings: list[SectionPlausibilityWarning] = []
+    for section, section_text in sections.items():
+        section_chars = len(section_text)
+        fraction = section_chars / document_chars
+        checks: list[PlausibilityCheck] = []
+        if fraction < PLAUSIBLE_SECTION_MIN_FRACTION:
+            checks.append("fraction_of_document")
+        if section_chars < PLAUSIBLE_SECTION_MIN_CHARS:
+            checks.append("absolute_floor")
+        if checks:
+            warnings.append(
+                SectionPlausibilityWarning(
+                    section=section,
+                    section_chars=section_chars,
+                    document_chars=document_chars,
+                    fraction=fraction,
+                    checks=tuple(checks),
+                )
+            )
+    return tuple(warnings)
 
 
 class EdgarGateway(Protocol):
@@ -54,6 +125,7 @@ class ResearchOutcome:
     filing_url: str
     summaries: dict[str, str]
     thesis_snapshot_id: int | None
+    section_warnings: tuple[SectionPlausibilityWarning, ...] = ()
 
 
 def compose_thesis(company: CompanyRef, filing: FilingRef, summaries: dict[str, str]) -> str:
@@ -130,6 +202,14 @@ class ResearchService:
         content_sha256 = hashlib.sha256(html.encode("utf-8")).hexdigest()
         sections = extract_sections(html)
 
+        # Flag-not-block: warnings are logged and carried on the outcome, but
+        # summarization and storage proceed unchanged.
+        section_warnings = check_section_plausibility(html, sections)
+        for warning in section_warnings:
+            _logger.warning(
+                "%s %s: %s", company.ticker, filing.accession_number, warning.describe()
+            )
+
         summaries: dict[str, str] = {}
         for section, section_text in sections.items():
             try:
@@ -164,4 +244,5 @@ class ResearchService:
             filing_url=filing.filing_url,
             summaries=summaries,
             thesis_snapshot_id=snapshot_id,
+            section_warnings=section_warnings,
         )

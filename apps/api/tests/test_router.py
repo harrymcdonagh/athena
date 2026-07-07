@@ -34,7 +34,15 @@ from apps.api.tests.test_qa import (
     FakeComparisonAnswerer,
     FakeQaAnswerer,
 )
-from apps.api.tests.test_service import EIGHT_K, FILING, PRIOR_FILING, FakeEdgar, FakeSummarizer
+from apps.api.tests.test_service import (
+    EIGHT_K,
+    FILING,
+    FRACTION_TRIP_HTML,
+    PRIOR_FILING,
+    FakeEdgar,
+    FakeSummarizer,
+    FixedDocumentEdgar,
+)
 
 
 class UnknownTickerEdgar(FakeEdgar):
@@ -74,6 +82,7 @@ def test_post_research_twice_returns_200_skipped(client: TestClient) -> None:
     assert body["filing_id"] == first.json()["filing_id"]
     assert body["summaries"] == {}
     assert body["thesis_snapshot_id"] is None
+    assert body["section_warnings"] == []  # the skipped path never audits sections
 
 
 def test_post_research_with_accession_param_ingests_that_filing(
@@ -116,6 +125,29 @@ def test_post_research_non_10k_accession_returns_422(client: TestClient, db: Eng
 def test_research_response_shape(client: TestClient) -> None:
     body = client.post("/research/AAPL").json()
     assert set(body) == set(ResearchResponse.model_fields)
+
+
+def test_post_research_surfaces_section_plausibility_warnings(
+    client: TestClient, db: Engine
+) -> None:
+    service = ResearchService(
+        edgar=FixedDocumentEdgar(FRACTION_TRIP_HTML), summarizer=FakeSummarizer(), engine=db
+    )
+    app.dependency_overrides[get_research_service] = lambda: service
+
+    body = client.post("/research/AAPL").json()
+
+    assert body["status"] == "ingested"  # flag-not-block: the warning is not an error
+    (warning,) = body["section_warnings"]
+    assert warning["section"] == "mdna"
+    assert warning["checks"] == ["fraction_of_document"]
+    assert warning["section_chars"] > 0 and warning["document_chars"] > warning["section_chars"]
+    assert 0 < warning["fraction"] < 1
+
+
+def test_healthy_ingest_has_empty_section_warnings(client: TestClient) -> None:
+    body = client.post("/research/AAPL").json()
+    assert body["section_warnings"] == []
 
 
 def test_post_research_unknown_ticker_returns_404(client: TestClient, db: Engine) -> None:

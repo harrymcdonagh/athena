@@ -31,7 +31,7 @@ from apps.api.edgar.client import (
 )
 from apps.api.edgar.sections import SectionExtractionError
 from apps.api.research.repository import Repository
-from apps.api.research.service import ResearchService
+from apps.api.research.service import ResearchService, SectionPlausibilityWarning
 from apps.api.research.summarizer import ClaudeSummarizer
 
 TICKER_LIST_PATH = Path(__file__).resolve().parents[3] / "docs/domain/sp100-tickers.txt"
@@ -62,6 +62,9 @@ class TickerResult:
     accession_number: str | None = None
     category: FailureCategory | None = None
     reason: str | None = None
+    # Section-plausibility warnings are a channel DISTINCT from failure: the
+    # filing ingested and is stored; its sections just look suspicious.
+    section_warnings: tuple[SectionPlausibilityWarning, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -83,6 +86,12 @@ class BatchReport:
     @property
     def failures(self) -> tuple[TickerResult, ...]:
         return tuple(r for r in self.results if r.status == "failed")
+
+    @property
+    def warned(self) -> tuple[TickerResult, ...]:
+        """Results carrying section-plausibility warnings. Orthogonal to
+        status: ingested + skipped + failed == attempted always holds."""
+        return tuple(r for r in self.results if r.section_warnings)
 
 
 def parse_ticker_list(text: str) -> list[str]:
@@ -190,6 +199,7 @@ def run_batch(
                 ticker=ticker,
                 status=outcome.status,
                 accession_number=outcome.accession_number,
+                section_warnings=outcome.section_warnings,
             )
         )
     return BatchReport(results=tuple(results))
@@ -205,6 +215,13 @@ def format_report(report: BatchReport) -> str:
         lines += [f"  {r.ticker}: {r.category} — {r.reason}" for r in report.failures]
     else:
         lines.append("no failures; every ticker ingested or already stored")
+    if report.warned:
+        lines.append("section-plausibility warnings (ingested and stored; review advised):")
+        lines += [
+            f"  {r.ticker} ({r.accession_number}): {w.describe()}"
+            for r in report.warned
+            for w in r.section_warnings
+        ]
     return "\n".join(lines)
 
 
