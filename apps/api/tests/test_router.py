@@ -2,6 +2,7 @@ import inspect
 from collections.abc import Iterator
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from sqlalchemy import Engine, text
 
@@ -11,7 +12,14 @@ from apps.api.edgar.client import CompanyRef, TickerNotFoundError
 from apps.api.main import app
 from apps.api.research.compare import QUALIFYING_SIMILARITY_FLOOR, MockColumnAnswerer
 from apps.api.research.embeddings import EmbeddedChunk, EmbeddingError
-from apps.api.research.qa import Claim, ComparisonDraft, ComparisonResult, QaAnswer, QaAnswerer
+from apps.api.research.qa import (
+    Claim,
+    ClaudeColumnAnswerer,
+    ComparisonDraft,
+    ComparisonResult,
+    QaAnswer,
+    QaAnswerer,
+)
 from apps.api.research.repository import Repository
 from apps.api.research.router import (
     CompaniesResponse,
@@ -798,13 +806,16 @@ def test_find_embedding_failure_returns_502(search_client: TestClient, db: Engin
     assert "voyage" in response.json()["detail"]
 
 
-# --- GET /research/compare (ADR-0012: mocked build — no live answer model) ---
+# --- GET /research/compare (ADR-0012: live build — tests still use the mock) ---
 
 
 @pytest.fixture
 def compare_client(db: Engine) -> Iterator[TestClient]:
     app.dependency_overrides[get_embedder] = lambda: QueryOnlyEmbedder(axis_vector(0))
     app.dependency_overrides[get_read_engine] = lambda: db
+    # The live build's answerer is Claude-backed; the suite overrides it with
+    # the deterministic mock so tests keep spending zero live tokens.
+    app.dependency_overrides[get_column_answerer] = MockColumnAnswerer
     yield TestClient(app)
     app.dependency_overrides.clear()
 
@@ -849,12 +860,28 @@ def test_compare_over_cap_is_a_400_refusal_naming_the_cap(
     assert "at most 5" in response.json()["detail"]
 
 
-def test_compare_answerer_is_the_mock_in_this_build() -> None:
-    """ADR-0012 mocked build: the shipped column answerer is the deterministic
-    mock — get_column_answerer() in router.py is THE single point where the
-    live model is swapped in after review."""
+def test_compare_answerer_is_live_and_key_gated(monkeypatch: pytest.MonkeyPatch) -> None:
+    """ADR-0012 live build: get_column_answerer() was THE single swap point,
+    and it swapped — the shipped answerer is Claude-backed, gated on the API
+    key exactly like get_qa_answerer (503, never a silent mock fallback)."""
+    monkeypatch.setattr(
+        "apps.api.research.router.get_settings",
+        lambda: Settings(anthropic_api_key="", voyage_api_key="present"),
+    )
     get_column_answerer.cache_clear()
-    assert isinstance(get_column_answerer(), MockColumnAnswerer)
+    try:
+        with pytest.raises(HTTPException) as excinfo:
+            get_column_answerer()
+        assert excinfo.value.status_code == 503
+        assert "COMPARE unavailable" in excinfo.value.detail
+        monkeypatch.setattr(
+            "apps.api.research.router.get_settings",
+            lambda: Settings(anthropic_api_key="test-key", voyage_api_key="present"),
+        )
+        get_column_answerer.cache_clear()
+        assert isinstance(get_column_answerer(), ClaudeColumnAnswerer)
+    finally:
+        get_column_answerer.cache_clear()
 
 
 def test_compare_response_cannot_carry_a_ranking_or_ordering() -> None:

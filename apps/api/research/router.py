@@ -12,7 +12,6 @@ from apps.api.edgar.sections import SECTIONS, SectionExtractionError
 from apps.api.research.compare import (
     ColumnAnswerer,
     CompareRefusal,
-    MockColumnAnswerer,
     compare_companies,
 )
 from apps.api.research.embeddings import (
@@ -24,6 +23,7 @@ from apps.api.research.embeddings import (
 from apps.api.research.find import find_companies
 from apps.api.research.qa import (
     ChangeEntry,
+    ClaudeColumnAnswerer,
     ClaudeQaAnswerer,
     ComparisonAnswerer,
     QaAnswer,
@@ -89,13 +89,16 @@ def get_comparison_answerer() -> ComparisonAnswerer:
 
 @lru_cache
 def get_column_answerer() -> ColumnAnswerer:
-    # ADR-0012 mocked build: COMPARE ships with the deterministic mock, so the
-    # whole path (dedup, refusal, pinning, filing-scoped retrieval, entries,
-    # coverage, citation binding) runs with zero live answer-model spend.
-    # THE single live-swap point: after this build is reviewed, return a
-    # Claude-backed ColumnAnswerer here (API-key-gated like get_qa_answerer);
-    # nothing else changes for the live build.
-    return MockColumnAnswerer()
+    # ADR-0012 live build: THE single swap point, exercised after the mocked
+    # build's review pass. Key-gated like get_qa_answerer. The test suite
+    # never reaches this: compare_client overrides the dependency with the
+    # deterministic mock, so tests still spend zero live tokens.
+    settings = get_settings()
+    if not settings.anthropic_api_key:
+        raise HTTPException(
+            status_code=503, detail="COMPARE unavailable: ANTHROPIC_API_KEY is not set"
+        )
+    return ClaudeColumnAnswerer(api_key=settings.anthropic_api_key)
 
 
 class SectionWarningResponse(BaseModel):
@@ -478,7 +481,7 @@ def compare(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    except EmbeddingError as exc:
+    except (EmbeddingError, QaError) as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     return CompareResponse(
         query=result.query,

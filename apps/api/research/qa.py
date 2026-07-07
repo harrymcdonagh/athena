@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import Engine, create_engine
 
 from apps.api.config import get_settings
+from apps.api.research.compare import ColumnDraft
 from apps.api.research.embeddings import (
     Embedder,
     VoyageEmbedder,
@@ -212,6 +213,78 @@ class ClaudeQaAnswerer:
             ],
             output_format=ComparisonDraft,
         )
+        draft = response.parsed_output
+        if draft is None:
+            raise QaError(f"model returned no parsed draft (stop_reason={response.stop_reason!r})")
+        return draft
+
+
+# The per-column prompt for COMPARE (ADR-0012 #4). Load-bearing policy like
+# _SYSTEM_PROMPT above — review changes against the ADR, not as copy tweaks.
+# The #6a seam guarantees each call sees ONE company's ONE pinned filing, so
+# cross-company ranking never has the input that would tempt it; what the
+# prompt must still hold is the within-column ADR-0007 line (attribution, no
+# editorializing) and the honest-empty-draft outcome (ADR-0012 #5).
+_COLUMN_SYSTEM_PROMPT = (
+    "You draft ONE column of Athena's side-by-side SEC filing comparison. You"
+    " see passages from exactly one company's one filing, labelled C1, C2, ...,"
+    " and a comparison topic.\n"
+    "\n"
+    "Draft factual statements of what THIS filing says on the topic:\n"
+    "- Use ONLY the supplied passages. Background knowledge about the company,"
+    " its financials, or its industry is off-limits, even when you are certain"
+    " it is correct (ADR-0007 §4).\n"
+    "- Every statement cites the passage label(s) it rests on via chunk_ids."
+    " Put no URLs, no dates, and no section names in the statement text —"
+    " provenance is stamped mechanically from the database.\n"
+    "- Report the filing's own evaluative language explicitly attributed"
+    ' ("management characterizes X as ..."); never evaluate in your own voice,'
+    " and never use recommendation language (ADR-0007 §3).\n"
+    "- Mention no other company and draw no comparison; this column stands"
+    " alone. Superlatives and ranking language (most, best, least, strongest,"
+    " weakest, worst, better, worse) are banned (ADR-0012 #4).\n"
+    "- If the passages do not address the topic, return an empty claims list."
+    ' An honest "this filing is silent here" is a first-class outcome'
+    " (ADR-0012 #5); never manufacture relevance from tangent passages."
+)
+
+
+def build_column_prompt(query: str, chunks: Mapping[str, ChunkMatch]) -> str:
+    # Deliberately no source_url in the rendering: the draft cites labels only
+    # (ADR-0012 #4 draft/resolved split), so URLs never enter the model's
+    # context and a model-copied URL is unrepresentable, not merely checked.
+    rendered = "\n\n".join(
+        f'<passage label="{label}" section="{match.section}">\n{match.content}\n</passage>'
+        for label, match in chunks.items()
+    )
+    return (
+        f"Comparison topic: {query}\n\n"
+        f"Passages from this one filing (the ONLY material you may use):\n\n{rendered}"
+    )
+
+
+class ClaudeColumnAnswerer:
+    """Live ColumnAnswerer (ADR-0012 live build). Lives HERE, not in
+    compare.py, so the compare module keeps zero model imports — the same
+    no-answerer-import posture as FIND. anthropic errors are wrapped in
+    QaError at this boundary so no anthropic type crosses into compare."""
+
+    model = _MODEL
+
+    def __init__(self, api_key: str) -> None:
+        self._client = anthropic.Anthropic(api_key=api_key)
+
+    def draft_column(self, query: str, chunks: dict[str, ChunkMatch]) -> ColumnDraft:
+        try:
+            response = self._client.messages.parse(
+                model=self.model,
+                max_tokens=16000,
+                system=_COLUMN_SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": build_column_prompt(query, chunks)}],
+                output_format=ColumnDraft,
+            )
+        except anthropic.APIError as exc:
+            raise QaError(f"anthropic: {exc}") from exc
         draft = response.parsed_output
         if draft is None:
             raise QaError(f"model returned no parsed draft (stop_reason={response.stop_reason!r})")
