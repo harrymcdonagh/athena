@@ -42,22 +42,34 @@ MAX_COMPARE_COMPANIES = 5
 # starting constant, earned by live validation (known-rich specimen +
 # wider-retrieval diff), tuned at the constant only — never a runtime
 # argument drifting upward. min()-clamped like FIND's caps.
+# Live validation 2026-07-07 (GOOG/MSFT/META on AI risks; V/KO/CAT on
+# crypto; HD on tariffs): every column emitted substantive cited claims from
+# 2 passages, and the GOOG-on-AI specimen surfaced its genuine AI-risk
+# disclosure — the FIND-era boilerplate-outscores-substance miss does not
+# recur in filing-scoped stage 2, where a company's chunks compete only with
+# each other. The k=8 diff DID find on-topic, above-floor passages left
+# unconsulted at ranks 3+ (GOOG state-AI-legislation 0.4137 and AI-cyber
+# 0.4046; V alternative-payment-systems risk 0.2170), so 2 is a real
+# narrowness trade, not free; raising to 3 is the recorded candidate if
+# column omissions bite, decided at this constant with a rerun of the same
+# specimens.
 PASSAGES_PER_COMPANY_COMPARE = 2
 # How many chunks of the pinned filing the coverage scan reads to count
 # qualifying passages. Bounds the one scoped vector query; when the scan
 # saturates, `qualifying` is a floor, not an exact count.
 COVERAGE_SCAN_LIMIT = 24
 # Similarity floor a passage must clear to count as qualifying (and to be
-# consulted). UNVALIDATED for stage-2 per-filing distributions (build review
-# finding #1): the only calibration datum — HD's genuine tariff match at
-# 0.2397 — came from FIND's stage-1 GLOBAL ranking, a different distribution.
-# The floor sits in the coverage display's denominator and gates the model
-# call, so it is a first-rank live-validate item alongside the passage cap:
-# the k=6-8 omission diff must check whether omitted-material passages score
-# below it, and the specimen set must include a weak-but-real match (the
-# HD-tariff class) to catch a false below-floor "silence". Tuned at the
-# constant only, with before/after evidence, per the live-validation
-# discipline.
+# consulted). VALIDATED for stage-2 2026-07-07 (closing build review finding
+# #1): cosine similarity is per-chunk and pool-independent, so FIND's
+# calibration datum transfers exactly — HD's genuine tariff chunk scored the
+# same 0.2397 in filing-scoped stage 2, cleared the floor, and its column
+# emitted (no false below-floor silence on the weak-but-real specimen).
+# Observed stage-2 separation: genuine matches 0.2162-0.4893; true absences
+# peaked at 0.106 (KO/CAT on crypto), landing as no_finding/below_floor with
+# zero model calls. Margin note: one weakly-related HD chunk squeaked over at
+# 0.2003 (qualifying-but-unconsulted), so the floor is slightly permissive at
+# the boundary — harmless under the passage cap. Tuned at the constant only,
+# with before/after evidence, per the live-validation discipline.
 QUALIFYING_SIMILARITY_FLOOR = 0.20
 
 

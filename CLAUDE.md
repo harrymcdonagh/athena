@@ -113,14 +113,17 @@ python -m apps.api.research.embeddings   # embedding backfill
 
 ## Pending queue
 
-- **COMPARE live swap** (next): the mocked build (f7c221a) needs its review
-  pass, then swap the single live point `get_column_answerer()` in router.py,
-  then live-validate twice per ADR-0012 — must include the known-rich
-  specimen (GOOG on AI risk) and a wider-retrieval diff (k=6–8) against each
-  2-passage column; `PASSAGES_PER_COMPANY_COMPARE = 2` is an open question
-  resolved only with that corpus evidence, tuned at the constant.
-- **Branch is ahead of origin by 2 commits, unpushed** (b321b6b ADR-0012
-  acceptance, f7c221a COMPARE mocked build). Do not assume origin is current.
+- **COMPARE is LIVE and validated** (2026-07-07): `get_column_answerer()`
+  swapped to the Claude-backed answerer; live-validated on three specimen
+  runs (GOOG/MSFT/META on AI risks — the known-rich specimen surfaced its
+  genuine disclosure; V/KO/CAT on crypto — honest below-floor absences with
+  zero model calls; HD on tariffs — weak-but-real match cleared the floor)
+  plus a live refusal check (6 names, zero tokens). Evidence recorded at the
+  constants in compare.py. Open knob: `PASSAGES_PER_COMPANY_COMPARE` 2→3 if
+  column omissions bite (k=8 diff found on-topic above-floor passages at
+  ranks 3+).
+- **Push discipline:** commits may accumulate locally; check
+  `git log origin/main..HEAD` before assuming origin is current.
 - **Uncommitted:** apps/web React+Vite frontend and the CORS middleware in
   `apps/api/main.py` — in-progress frontend work; don't sweep it into
   unrelated commits.
