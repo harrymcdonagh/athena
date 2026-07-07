@@ -94,9 +94,13 @@ python -m apps.api.research.embeddings   # embedding backfill
   (f7c221a): CIK-deduped named set ≤5, refusal at cap, filing-pinned
   per-column synthesis, coverage counts, `MockColumnAnswerer` pending review
   and live swap.
-- **Corpus:** ~84 companies / 85 filings / ~8,277 chunks from a 101-symbol
-  S&P 100 snapshot (`docs/domain/sp100-tickers.txt`); 16 filers known-absent
-  (10-Ks that incorporate sections by reference defeat section extraction).
+- **Corpus:** 84 companies / 85 filings / 8,277 chunks (verified against the
+  DB 2026-07-07) from a 101-symbol S&P 100 snapshot
+  (`docs/domain/sp100-tickers.txt`); 16 filers known-absent (10-Ks that
+  incorporate sections by reference defeat section extraction): BNY, C, COP,
+  CVX, DE, GE, HON, IBM, INTC, JPM, MCD, MS, NOW, USB, WFC, XOM. A raw
+  ticker diff also shows GOOGL — not absent: it shares Alphabet's CIK with
+  GOOG, which is ingested (companies are keyed by CIK).
   Extraction repair f5f39ee re-embedded 13 corrupted filings; corpus clean.
 - **Tests:** ~262 collected and passing (`pytest`).
 - **Batch ingestion** reports categorized failures (`unresolved`, `not_found`,
