@@ -9,6 +9,12 @@ from apps.api.config import get_settings
 from apps.api.db import get_engine
 from apps.api.edgar.client import EdgarClient, FilingNotFoundError, TickerNotFoundError
 from apps.api.edgar.sections import SECTIONS, SectionExtractionError
+from apps.api.research.compare import (
+    ColumnAnswerer,
+    CompareRefusal,
+    MockColumnAnswerer,
+    compare_companies,
+)
 from apps.api.research.embeddings import (
     Embedder,
     EmbeddingError,
@@ -81,6 +87,17 @@ def get_comparison_answerer() -> ComparisonAnswerer:
     return ClaudeQaAnswerer(api_key=settings.anthropic_api_key)
 
 
+@lru_cache
+def get_column_answerer() -> ColumnAnswerer:
+    # ADR-0012 mocked build: COMPARE ships with the deterministic mock, so the
+    # whole path (dedup, refusal, pinning, filing-scoped retrieval, entries,
+    # coverage, citation binding) runs with zero live answer-model spend.
+    # THE single live-swap point: after this build is reviewed, return a
+    # Claude-backed ColumnAnswerer here (API-key-gated like get_qa_answerer);
+    # nothing else changes for the live build.
+    return MockColumnAnswerer()
+
+
 class SectionWarningResponse(BaseModel):
     """HTTP mirror of SectionPlausibilityWarning — flag-not-block, so it rides
     on a successful (200, ingested) response like QaResponse.warnings does."""
@@ -149,6 +166,55 @@ class FindResponse(BaseModel):
 
     query: str
     matches: list[FindCompanyMatchResponse]
+
+
+class CompareStatementResponse(BaseModel):
+    text: str
+    source_url: str
+
+
+class ComparePassageResponse(BaseModel):
+    label: str
+    snippet: str
+    source_url: str
+    similarity: float
+
+
+class CompareCoverageResponse(BaseModel):
+    """Mechanical coverage signal (ADR-0012 #3): a retrieval fact, so a
+    starved column self-reports ('2 of 9') instead of reading as complete."""
+
+    qualifying: int
+    consulted: int
+
+
+class ComparePinnedFilingResponse(BaseModel):
+    form_type: str
+    period_end_date: str
+    filing_url: str
+
+
+class CompareEntryResponse(BaseModel):
+    """One typed entry in the single ordered list (ADR-0012 #2). Deliberately
+    has no rank/score field and no cross-company text field: a ranking is
+    structurally unrepresentable, like FIND's response."""
+
+    kind: Literal["column", "no_finding", "unresolved", "no_evidence"]
+    symbol: str
+    company_name: str | None = None
+    cik: str | None = None
+    filing: ComparePinnedFilingResponse | None = None
+    statements: list[CompareStatementResponse] = []
+    coverage: CompareCoverageResponse | None = None
+    no_finding_cause: Literal["retrieval_empty", "model_declined"] | None = None
+    consulted_passages: list[ComparePassageResponse] = []
+    warnings: list[str] = []
+
+
+class CompareResponse(BaseModel):
+    query: str
+    partial: bool  # True when any asked-for name failed (unresolved/no_evidence)
+    entries: list[CompareEntryResponse]  # one per deduplicated name, caller order
 
 
 class CompanyListItem(BaseModel):
@@ -385,6 +451,62 @@ def find(
                 passages=[FindPassageResponse(**vars(p)) for p in match.passages],
             )
             for match in result.matches
+        ],
+    )
+
+
+@router.get("/research/compare", response_model=CompareResponse)
+def compare(
+    q: str,
+    tickers: Annotated[list[str], Query()],
+    engine: Annotated[Engine, Depends(get_read_engine)],
+    embedder: Annotated[Embedder, Depends(get_embedder)],
+    answerer: Annotated[ColumnAnswerer, Depends(get_column_answerer)],
+) -> CompareResponse:
+    # Order of operations is the compare module's contract (ADR-0012 #1):
+    # resolve + CIK-dedup (cache reads only), refuse over 5, then pin and
+    # synthesize per column. Caps are structural constants, not request knobs.
+    try:
+        result = compare_companies(engine, embedder, answerer, tickers, q)
+    except CompareRefusal as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except EmbeddingError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return CompareResponse(
+        query=result.query,
+        partial=result.partial,
+        entries=[
+            CompareEntryResponse(
+                kind=entry.kind,
+                symbol=entry.symbol,
+                company_name=entry.company_name,
+                cik=entry.cik,
+                filing=(
+                    ComparePinnedFilingResponse(
+                        form_type=entry.filing.form_type,
+                        period_end_date=entry.filing.period_end_date.isoformat(),
+                        filing_url=entry.filing.filing_url,
+                    )
+                    if entry.filing is not None
+                    else None
+                ),
+                statements=[
+                    CompareStatementResponse(**vars(statement)) for statement in entry.statements
+                ],
+                coverage=(
+                    CompareCoverageResponse(**vars(entry.coverage))
+                    if entry.coverage is not None
+                    else None
+                ),
+                no_finding_cause=entry.no_finding_cause,
+                consulted_passages=[
+                    ComparePassageResponse(**vars(passage)) for passage in entry.consulted_passages
+                ],
+                warnings=entry.warnings,
+            )
+            for entry in result.entries
         ],
     )
 

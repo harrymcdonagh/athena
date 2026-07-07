@@ -64,6 +64,19 @@ class CompanyListing:
 
 
 @dataclass(frozen=True)
+class PinnedFiling:
+    """The filing a COMPARE column speaks for (ADR-0012 #3): a company's most
+    recent ingested annual report by the ADR-0008 §1 ordering."""
+
+    filing_id: int
+    ticker: str
+    company_name: str
+    form_type: str
+    period_end_date: date
+    filing_url: str
+
+
+@dataclass(frozen=True)
 class TickerReference:
     """One identity row from the sec_ticker_reference external cache (ADR-0010)."""
 
@@ -413,6 +426,37 @@ class Repository:
             )
             for row in rows
         ]
+
+    def latest_annual_filing(self, cik: str) -> PinnedFiling | None:
+        """The most recent ingested 10-K for the company with this CIK — the
+        filing a COMPARE column is pinned to (ADR-0012 #3).
+
+        ADR-0008 §1 ordering (period_end_date, filing_date, accession_number),
+        scoped to the annual report and its amendment: a 10-K/A shares the
+        10-K's period_end_date and wins on the filing_date tie-break, so the
+        amendment — the filer's corrected statement — speaks for the period.
+        No 10-K held (even when other filings are) → None: COMPARE's
+        no_evidence category is defined on the 10-K (ADR-0012 #2)."""
+        row = self._conn.execute(
+            text(
+                "SELECT f.id, c.ticker, c.name, f.form_type, f.period_end_date, f.filing_url"
+                " FROM filings f JOIN companies c ON c.id = f.company_id"
+                " WHERE c.cik = :cik AND f.form_type IN ('10-K', '10-K/A')"
+                " ORDER BY f.period_end_date DESC, f.filing_date DESC,"
+                " f.accession_number DESC LIMIT 1"
+            ),
+            {"cik": cik},
+        ).one_or_none()
+        if row is None:
+            return None
+        return PinnedFiling(
+            filing_id=row.id,
+            ticker=row.ticker,
+            company_name=row.name,
+            form_type=row.form_type,
+            period_end_date=row.period_end_date,
+            filing_url=row.filing_url,
+        )
 
     def resolve_ticker_from_reference(self, ticker: str) -> TickerReference | None:
         """Identity (CIK, conformed name, exchange) from the sec_ticker_reference

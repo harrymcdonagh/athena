@@ -9,18 +9,21 @@ import apps.api.research.find as find_module
 from apps.api.config import Settings
 from apps.api.edgar.client import CompanyRef, TickerNotFoundError
 from apps.api.main import app
+from apps.api.research.compare import MockColumnAnswerer
 from apps.api.research.embeddings import EmbeddedChunk, EmbeddingError
 from apps.api.research.qa import Claim, ComparisonDraft, ComparisonResult, QaAnswer, QaAnswerer
 from apps.api.research.repository import Repository
 from apps.api.research.router import (
     CompaniesResponse,
     CompanyListItem,
+    CompareResponse,
     ComparisonResponse,
     FindCompanyMatchResponse,
     FindPassageResponse,
     FindResponse,
     QaResponse,
     ResearchResponse,
+    get_column_answerer,
     get_comparison_answerer,
     get_embedder,
     get_qa_answerer,
@@ -29,6 +32,12 @@ from apps.api.research.router import (
 )
 from apps.api.research.router import find as find_endpoint
 from apps.api.research.service import ResearchService
+from apps.api.tests.test_compare import (
+    seed_ready_company,
+)
+from apps.api.tests.test_compare import (
+    seed_reference as seed_compare_reference,
+)
 from apps.api.tests.test_embeddings import (
     QueryOnlyEmbedder,
     axis_vector,
@@ -782,3 +791,57 @@ def test_find_embedding_failure_returns_502(search_client: TestClient, db: Engin
     response = search_client.get("/research/find", params={"q": "growth"})
     assert response.status_code == 502
     assert "voyage" in response.json()["detail"]
+
+
+# --- GET /research/compare (ADR-0012: mocked build — no live answer model) ---
+
+
+@pytest.fixture
+def compare_client(db: Engine) -> Iterator[TestClient]:
+    app.dependency_overrides[get_embedder] = lambda: QueryOnlyEmbedder(axis_vector(0))
+    app.dependency_overrides[get_read_engine] = lambda: db
+    yield TestClient(app)
+    app.dependency_overrides.clear()
+
+
+def test_compare_returns_one_ordered_typed_entries_list(
+    compare_client: TestClient, db: Engine
+) -> None:
+    """ADR-0012 #2: columns and failures share ONE ordered list in caller
+    order — there is no side failure list a renderer could skip."""
+    seed_ready_company(db)
+    response = compare_client.get(
+        "/research/compare", params={"q": "tariffs", "tickers": ["AAPL", "MISSING"]}
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert set(body) == set(CompareResponse.model_fields)
+    assert body["partial"] is True
+    assert [entry["kind"] for entry in body["entries"]] == ["column", "unresolved"]
+    assert [entry["symbol"] for entry in body["entries"]] == ["AAPL", "MISSING"]
+    column = body["entries"][0]
+    assert column["coverage"] == {"qualifying": 2, "consulted": 2}
+    assert column["filing"]["form_type"] == "10-K"
+    for statement in column["statements"]:
+        assert statement["source_url"].startswith("https://sec.gov/")
+
+
+def test_compare_over_cap_is_a_400_refusal_naming_the_cap(
+    compare_client: TestClient, db: Engine
+) -> None:
+    for i, ticker in enumerate(["AAPL", "MSFT", "GOOG", "AMZN", "NVDA", "META"]):
+        seed_compare_reference(db, ticker, f"000000000{i}", f"Company {ticker}")
+    response = compare_client.get(
+        "/research/compare",
+        params={"q": "tariffs", "tickers": ["AAPL", "MSFT", "GOOG", "AMZN", "NVDA", "META"]},
+    )
+    assert response.status_code == 400
+    assert "at most 5" in response.json()["detail"]
+
+
+def test_compare_answerer_is_the_mock_in_this_build() -> None:
+    """ADR-0012 mocked build: the shipped column answerer is the deterministic
+    mock — get_column_answerer() in router.py is THE single point where the
+    live model is swapped in after review."""
+    get_column_answerer.cache_clear()
+    assert isinstance(get_column_answerer(), MockColumnAnswerer)
