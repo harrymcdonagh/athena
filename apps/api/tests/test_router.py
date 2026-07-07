@@ -16,7 +16,12 @@ from apps.api.research.repository import Repository
 from apps.api.research.router import (
     CompaniesResponse,
     CompanyListItem,
+    CompareCoverageResponse,
+    CompareEntryResponse,
+    ComparePassageResponse,
+    ComparePinnedFilingResponse,
     CompareResponse,
+    CompareStatementResponse,
     ComparisonResponse,
     FindCompanyMatchResponse,
     FindPassageResponse,
@@ -845,3 +850,33 @@ def test_compare_answerer_is_the_mock_in_this_build() -> None:
     live model is swapped in after review."""
     get_column_answerer.cache_clear()
     assert isinstance(get_column_answerer(), MockColumnAnswerer)
+
+
+def test_compare_response_cannot_carry_a_ranking_or_ordering() -> None:
+    """ADR-0012 #4 / wall-guard tripwire: a cross-company ranking must be
+    structurally unrepresentable in the COMPARE payload — no response model
+    has a field that could carry one. match_strength is a retrieval fact
+    that is fine in FIND (ADR-0011 §5) and deliberately absent HERE: in a
+    side-by-side, strength and position read as judgment. This lands BEFORE
+    the live swap so a rank/score field leaking in with the real answerer
+    trips immediately."""
+    forbidden = {
+        "rank",
+        "ranking",
+        "score",
+        "rating",
+        "exposure",
+        "answer",
+        "explanation",
+        "match_strength",
+        "verdict",
+    }
+    for model in (
+        CompareResponse,
+        CompareEntryResponse,
+        ComparePinnedFilingResponse,
+        CompareStatementResponse,
+        CompareCoverageResponse,
+        ComparePassageResponse,
+    ):
+        assert forbidden.isdisjoint(model.model_fields), model.__name__
