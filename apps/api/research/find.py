@@ -23,9 +23,19 @@ from apps.api.research.repository import ChunkMatch, Repository
 #
 # How many chunks the stage-1 wide search retrieves. This bounds the one
 # global pgvector query — cheap indexed math, but bounded by design.
-WIDE_SEARCH_LIMIT = 40
+# 40 -> 80 after live validation (2026-07-07): text-heavy companies take 3+
+# chunks each, so a 40-chunk pool held only ~12-15 distinct companies — the
+# candidate cap couldn't see companies the wide search never retrieved.
+# Raising CANDIDATE_N without this would be half a fix. Pure pgvector/HNSW
+# math, near-free.
+WIDE_SEARCH_LIMIT = 80
 # How many candidate companies FIND returns (ADR-0011 §3 stage-1 bound).
-CANDIDATE_N = 10
+# 10 -> 15 after live validation: the cap was hit on 6/6 broad thematic
+# queries (every broad query was trimming), and confirmed misses HD (tariffs,
+# -0.003 below rank 10) and GOOG (AI-risk, -0.016) sat just under the cut.
+# Marginal cost per extra company is zero answer-model tokens (response size
+# only), so this is a free recall win.
+CANDIDATE_N = 15
 # How many citing passages each returned company carries (§3 per-company
 # evidence bound).
 PASSAGES_PER_COMPANY = 3
