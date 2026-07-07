@@ -1,6 +1,6 @@
 # 0011 — Cross-Company Query: FIND-First, Funnel Retrieval, Bounded Compare
 
-**Status:** Proposed
+**Status:** Accepted
 
 ## Context
 
