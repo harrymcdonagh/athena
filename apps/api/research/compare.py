@@ -119,8 +119,9 @@ class CitedStatement:
 
 @dataclass(frozen=True)
 class ConsultedPassage:
-    """One passage the answer model saw — attached to a model-declined
-    no_finding so the decline is auditable like any claim (ADR-0012 #5)."""
+    """One passage the answer model saw — attached to a model_declined or
+    claims_uncited no_finding so the decline (or the suppression) is
+    auditable like any claim (ADR-0012 #5)."""
 
     label: str
     snippet: str
@@ -153,10 +154,15 @@ class ColumnSynthesis:
     outcomes are ADR-0012 #5's split, three-way per the build review:
     no_embedded_evidence and below_floor are mechanical facts (the model is
     never consulted — corpus state and a low-confidence retrieval state,
-    respectively, neither of which is filing silence), while model_declined
-    is an audited model judgment (consulted passages attached)."""
+    respectively, neither of which is filing silence), while the last two
+    are audited model outcomes (consulted passages attached): model_declined
+    means the model emitted no claims at all, claims_uncited means it
+    asserted claims that all failed citation binding and were suppressed —
+    a model that hallucinated is not a model that declined."""
 
-    outcome: Literal["column", "no_embedded_evidence", "below_floor", "model_declined"]
+    outcome: Literal[
+        "column", "no_embedded_evidence", "below_floor", "model_declined", "claims_uncited"
+    ]
     coverage: Coverage
     statements: list[CitedStatement]
     consulted: list[ConsultedPassage]
@@ -176,7 +182,9 @@ class CompareEntry:
     filing: PinnedFiling | None = None  # column / no_finding: what the column speaks for
     statements: list[CitedStatement] = field(default_factory=list)
     coverage: Coverage | None = None
-    no_finding_cause: Literal["no_embedded_evidence", "below_floor", "model_declined"] | None = None
+    no_finding_cause: (
+        Literal["no_embedded_evidence", "below_floor", "model_declined", "claims_uncited"] | None
+    ) = None
     consulted_passages: list[ConsultedPassage] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
@@ -300,7 +308,10 @@ def synthesize_column(
             warnings=warnings,
         )
     return ColumnSynthesis(
-        outcome="model_declined",
+        # An empty draft is a decline; a draft whose every claim failed
+        # citation binding is suppressed assertion — different facts, and the
+        # warnings above name each drop (build review finding #4).
+        outcome="claims_uncited" if draft.claims else "model_declined",
         coverage=coverage,
         statements=[],
         consulted=consulted,
@@ -389,10 +400,13 @@ def compare_companies(
                 statements=synthesis.statements,
                 coverage=synthesis.coverage,
                 no_finding_cause=None if synthesis.outcome == "column" else synthesis.outcome,
-                # Attached on model_declined so the decline is auditable
-                # (ADR-0012 #5); a cited column audits through its citations.
+                # Attached on the audited model outcomes so the decline (or
+                # the suppression) is checkable (ADR-0012 #5); a cited column
+                # audits through its citations.
                 consulted_passages=(
-                    synthesis.consulted if synthesis.outcome == "model_declined" else []
+                    synthesis.consulted
+                    if synthesis.outcome in ("model_declined", "claims_uncited")
+                    else []
                 ),
                 warnings=synthesis.warnings,
             )

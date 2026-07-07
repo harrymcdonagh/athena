@@ -571,7 +571,12 @@ def test_unciteable_claims_are_dropped_with_warnings_never_emitted(db: Engine) -
     assert len(entry.warnings) == 2  # both drops reported, never silently swallowed
 
 
-def test_all_claims_unciteable_becomes_model_declined_with_warnings(db: Engine) -> None:
+def test_all_claims_unciteable_is_claims_uncited_not_a_decline(db: Engine) -> None:
+    """A model that asserted claims it could not cite did NOT decline — it
+    produced unauditable content that was suppressed. Labeling that
+    model_declined would dress a suppressed-hallucination case as an honest
+    'nothing to say' (build review finding #4). Distinct cause, consulted
+    passages and warnings attached, so the suppression is auditable."""
     seed_ready_company(db)
     answerer = SpyAnswerer(draft=ColumnDraft(claims=[ColumnClaim(text="uncited prose")]))
 
@@ -579,9 +584,9 @@ def test_all_claims_unciteable_becomes_model_declined_with_warnings(db: Engine) 
 
     (entry,) = result.entries
     assert entry.kind == "no_finding"
-    assert entry.no_finding_cause == "model_declined"
-    assert entry.consulted_passages  # the decline stays auditable
-    assert entry.warnings
+    assert entry.no_finding_cause == "claims_uncited"
+    assert entry.consulted_passages  # the suppression stays auditable
+    assert entry.warnings  # every drop named
 
 
 # --- caps and constants (ADR-0012 #3, ADR-0011 §3 posture) ---

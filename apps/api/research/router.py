@@ -210,7 +210,9 @@ class CompareEntryResponse(BaseModel):
     filing: ComparePinnedFilingResponse | None = None
     statements: list[CompareStatementResponse] = []
     coverage: CompareCoverageResponse | None = None
-    no_finding_cause: Literal["no_embedded_evidence", "below_floor", "model_declined"] | None = None
+    no_finding_cause: (
+        Literal["no_embedded_evidence", "below_floor", "model_declined", "claims_uncited"] | None
+    ) = None
     consulted_passages: list[ComparePassageResponse] = []
     warnings: list[str] = []
 
