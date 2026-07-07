@@ -1,22 +1,27 @@
 # Athena — Claude Guide
 
-## What is Athena?
+## What Athena is
 
-Athena is a personal Investment Research Operating System. It retrieves evidence,
-organises investment ideas, and explains analytical reasoning to support research.
-**It never makes investment decisions or places trades.** All conclusions are the
-user's sole responsibility.
+Athena is a personal Investment Research Operating System. It retrieves cited
+evidence from SEC filings and explains analytical reasoning to support the
+user's own research. **It NEVER makes buy/sell recommendations, never ranks
+companies by attractiveness, and never places trades.** All conclusions are
+the user's sole responsibility (ADR-0007).
 
 ## Directory Map
 
 ```
-apps/api/           FastAPI backend (Python 3.12+)
-apps/web/           Next.js frontend (placeholder)
-packages/           Shared Python packages (future)
-docs/decisions/     Architecture Decision Records (ADRs)
-docs/domain/        Domain knowledge and glossaries
-docs/architecture/  High-level design notes
-.claude/            Claude Code config and hooks
+apps/api/            FastAPI backend (Python 3.12+)
+apps/api/research/   Evidence layer: qa, find, compare, batch, embeddings, …
+apps/api/edgar/      SEC EDGAR client + section extraction
+apps/api/migrations/ Alembic revisions (explicit raw SQL, per ADR-0003/0005)
+apps/web/            React + Vite frontend (uncommitted work in progress)
+packages/            Shared Python packages (future)
+docs/decisions/      ADRs 0001–0012 — read before touching affected code
+docs/domain/         Domain knowledge (curated ticker list)
+docs/superpowers/    Plans and specs from past build slices
+.claude/skills/      Project skills: adr-workflow, wall-guard,
+                     commit-discipline, live-validation, filing-analysis
 ```
 
 ## Commands
@@ -24,29 +29,134 @@ docs/architecture/  High-level design notes
 ```bash
 source .venv/bin/activate            # activate venv (python3.12)
 uvicorn apps.api.main:app --reload   # start API → http://localhost:8000
-pytest                                # run all tests
-ruff check .                          # lint
-ruff format .                         # format
-mypy apps/                            # type check
+pytest                               # run all tests
+ruff check . && ruff format .        # lint + format
+mypy apps/                           # type check
+python -m apps.api.research.batch    # batch ingestion (then embeddings backfill)
+python -m apps.api.research.embeddings   # embedding backfill
 ```
 
-## Conventions (Non-Negotiable)
+## The evidence/judgment wall (load-bearing — never compromise)
 
-- **Never commit secrets.** No .env files, API keys, or tokens in any tracked file.
-- **Verify before claiming done.** Run `ruff check .` and `pytest`; show output.
-- **Conventional commits.** Prefixes: `feat:` `fix:` `chore:` `docs:` `refactor:` `test:`
-- **Edit existing files over creating new ones.** New file only when strictly necessary.
-- **No database or financial API code** without a written plan in `docs/decisions/`.
+- The evidence layer (cited QA, change detection, FIND, COMPARE) is
+  structurally separate from any future judgment layer.
+- **No verdict fields anywhere in evidence-layer schemas.** No buy/sell/hold,
+  no price targets, no attractiveness ranking, no evaluative language in
+  Athena's own voice (attributed source language, cited, is fine — ADR-0007 §3).
+- FIND results are ordered by `match_strength` — a retrieval fact about how
+  well filing TEXT matched the query — never by company judgment.
+  `apps/api/research/find.py` must never import an answerer module; the
+  zero-answer-model path is its contract (ADR-0011 §1).
+- COMPARE synthesizes per-column behind a `(filing_id, query)` seam with no
+  passage parameter, so cross-company ranking is unrepresentable; no
+  superlatives (most/best/least/worst), no computed ordering, caps enforced
+  as REFUSALS, never silent truncation (ADR-0012).
+- A future judgment layer requires its own ADR, must be labeled as judgment,
+  builds only on evidence-layer outputs, and uses read-only market data
+  (FMP/Finnhub/Polygon/FRED — never Trading 212).
+- **Prefer structural enforcement over test enforcement:** make violations
+  impossible by construction — the draft/resolved citation split in change
+  detection (model drafts chunk labels; URLs stamped from the database),
+  import boundaries in FIND, the no-passage-parameter seam in COMPARE — not
+  merely caught by tests.
 
-## Deeper Knowledge
+## Working disciplines (non-negotiable)
 
-Read relevant docs before making decisions:
+1. **ADR before migration.** Any schema, behavioral, or architectural change
+   starts with a draft ADR in Nygard format in `docs/decisions/`, gets a
+   review pass, is accepted, then implemented. Never write a migration — or
+   any database/financial-API code — without an accepted ADR.
+2. **One concern per commit.** Do not entangle unrelated changes.
+3. **Mocked-build-then-review-then-apply.** External API calls are mocked in
+   the initial build; the build is reviewed before any live spend.
+4. **Live-validate-twice for behavioral work.** Confirm the defect cleared
+   AND that adjacent legitimate behavior still emits (precedent: 7973c0a).
+5. **Honest absence over silent wrongness.** Failures are categorized and
+   reported (`unresolved` ≠ `not_found` — a bad list entry is not "EDGAR had
+   nothing"); missing data is clearly absent, never partially/silently wrong.
+6. **No-change-on-a-dimension is a first-class outcome** in change detection
+   (ADR-0009 §5); likewise `no_finding` in COMPARE (ADR-0012 #5).
+7. **Review findings can be wrong.** The maintainer overrides incorrect
+   findings; flag disagreement with reasoning rather than silently complying.
+8. **Never commit secrets.** No .env files, API keys, or tokens in tracked
+   files; `.env.example` documents names only.
+9. **Verify before claiming done.** Run `ruff check .` and `pytest`; show
+   output. Edit existing files over creating new ones.
 
-- `docs/decisions/` — ADRs: *why* choices were made. Read before touching affected code.
-- `docs/domain/` — Investment terminology. Don't guess domain concepts.
-- `docs/architecture/` — System design.
+## Current state (2026-07-07)
 
-## Compact Instructions
+- **Evidence layer complete through ADR-0012's mocked build.** Ingestion →
+  summaries → embeddings → cited QA (ADR-0007) → temporal corpus (ADR-0008)
+  → change detection with balanced per-period retrieval and mandatory
+  both-period citation (ADR-0009) → `sec_ticker_reference` as an external SEC
+  cache, distinct from `companies` (ADR-0010) → FIND cross-company mode with
+  zero answer-model calls (ADR-0011) → COMPARE mocked build committed
+  (f7c221a): CIK-deduped named set ≤5, refusal at cap, filing-pinned
+  per-column synthesis, coverage counts, `MockColumnAnswerer` pending review
+  and live swap.
+- **Corpus:** ~84 companies / 85 filings / ~8,277 chunks from a 101-symbol
+  S&P 100 snapshot (`docs/domain/sp100-tickers.txt`); 16 filers known-absent
+  (10-Ks that incorporate sections by reference defeat section extraction).
+  Extraction repair f5f39ee re-embedded 13 corrupted filings; corpus clean.
+- **Tests:** ~262 collected and passing (`pytest`).
+- **Batch ingestion** reports categorized failures (`unresolved`, `not_found`,
+  `parse_error`, `rate_limited`, `other`) with the accounting invariant
+  ingested + skipped + failed == attempted; section-plausibility warnings are
+  a distinct channel from failure.
+- **FIND recall knobs already widened and committed** (3687d8d):
+  `WIDE_SEARCH_LIMIT` 40→80, `CANDIDATE_N` 10→15, `PASSAGES_PER_COMPANY`
+  stays 3; live validation confirmed HD (tariff) and GOOG (AI-risk) surface.
+
+## Pending queue
+
+- **COMPARE live swap** (next): the mocked build (f7c221a) needs its review
+  pass, then swap the single live point `get_column_answerer()` in router.py,
+  then live-validate twice per ADR-0012 — must include the known-rich
+  specimen (GOOG on AI risk) and a wider-retrieval diff (k=6–8) against each
+  2-passage column; `PASSAGES_PER_COMPANY_COMPARE = 2` is an open question
+  resolved only with that corpus evidence, tuned at the constant.
+- **Branch is ahead of origin by 2 commits, unpushed** (b321b6b ADR-0012
+  acceptance, f7c221a COMPARE mocked build). Do not assume origin is current.
+- **Uncommitted:** apps/web React+Vite frontend and the CORS middleware in
+  `apps/api/main.py` — in-progress frontend work; don't sweep it into
+  unrelated commits.
+- **Backlog:** S&P 500 breadth run (deferred by choice, ADR-0010/0011);
+  incorporation-by-reference extractor for the 16 missing filers; content
+  dedupe for FIND; cross-encoder reranker (only if precision at the margin
+  matters); semantic-support check (ADR-0007's deferred enforcement); daily
+  briefing (ADR-0011 is its substrate); judgment layer (own ADR, behind the
+  wall).
+
+## Stack
+
+- Python 3.12 monorepo; FastAPI; Pydantic; SQLAlchemy 2.0 + psycopg3;
+  Postgres 16 + pgvector with HNSW index; Alembic migrations written as
+  explicit raw SQL; mypy strict; ruff.
+- Embeddings: Voyage `voyage-context-4` (contextualized chunks, 1024-dim);
+  documents embed with input type `document`, queries with `query` — same
+  space, asymmetric input types (ADR-0006). Model + dimension recorded per
+  chunk row.
+- SEC EDGAR is the primary source (fair-access: 10 req/s, declared
+  User-Agent). `sec_ticker_reference` caches the SEC ticker→CIK→name mapping;
+  identity is never hand-typed (ADR-0010).
+- Summarization/QA via the Anthropic API behind narrow protocols
+  (`Summarizer`, answerers); tests use deterministic fakes.
+- HTTP: `httpx2` everywhere EXCEPT anthropic-SDK exception handling, which
+  needs real `httpx` (see `import httpx2 as httpx` in batch.py).
+- Frontend: ADR-0002 chose Next.js, but the actual scaffold in `apps/web` is
+  React + Vite + TypeScript (uncommitted) — inspect before building on it.
+
+## Deeper knowledge
+
+- `docs/decisions/` — ADRs: *why* choices were made. Read before touching
+  affected code; ADR-0012 includes a Compliance and Validation section that
+  governs the COMPARE build.
+- `docs/domain/` — investment terminology and the curated ticker list. Don't
+  guess domain concepts.
+- `.claude/skills/` — adr-workflow, wall-guard, commit-discipline,
+  live-validation, filing-analysis.
+
+## Compact instructions
 
 When compacting, preserve:
 
