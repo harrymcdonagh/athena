@@ -82,6 +82,15 @@ python -m apps.api.research.embeddings   # embedding backfill
    files; `.env.example` documents names only.
 9. **Verify before claiming done.** Run `ruff check .` and `pytest`; show
    output. Edit existing files over creating new ones.
+10. **Keep the record current.** When a commit changes state this file
+    documents (Current state, Pending queue, test count, corpus counts, stack,
+    directory map) or that a README asserts (stack, run story, status), update
+    the relevant doc *in the same commit* — reverify numbers (pytest count, DB
+    corpus counts) rather than editing them from memory. A `Stop` hook
+    (`.claude/hooks/check-docs-drift.sh`) backstops this: after a commit that
+    changed code but not the docs it reminds once to check for drift. The hook
+    only reminds; the judgment and the edit are yours — if nothing documented
+    changed, say so and move on.
 
 ## Current state (2026-07-07)
 

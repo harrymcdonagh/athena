@@ -53,6 +53,17 @@
           }
         ]
       }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/hooks/check-docs-drift.sh",
+            "statusMessage": "Checking docs for state drift..."
+          }
+        ]
+      }
     ]
   }
 }
