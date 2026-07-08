@@ -308,6 +308,34 @@ def test_run_backfill_embeds_every_pending_section(db: Engine) -> None:
     assert chunk_count(db) == 4
 
 
+def test_run_backfill_embeds_source_text_while_summary_is_pending(db: Engine) -> None:
+    # ADR-0014 §2: retrieval is fed by source_text, which lands EAGERLY at ingest
+    # with the summary PENDING (NULL). The embeddings backfill must chunk that
+    # source_text with no summary present — otherwise lazy summarisation would
+    # break retrieval. Rows written exactly as ingest writes them.
+    filing_id = seed_filing(db)
+    with db.begin() as conn:
+        repo = Repository(conn)
+        for section in ("business", "mdna"):
+            repo.insert_pending_summary(
+                filing_id,
+                section,
+                source_text=f"full {section} section text",
+                source_url="https://sec.gov/filing.htm",
+                model="claude-sonnet-5",
+            )
+    with db.connect() as conn:
+        pending = conn.execute(
+            text("SELECT count(*) FROM filing_summaries WHERE summary IS NULL")
+        ).scalar_one()
+    assert pending == 2  # both sections pending — no summary computed
+
+    embedded = run_backfill(db, FakeEmbedder())
+
+    assert embedded == 2  # retrieval intact: source_text embedded despite pending summary
+    assert chunk_count(db) == 4
+
+
 def test_run_backfill_skips_sections_already_embedded_with_same_model(db: Engine) -> None:
     filing_id = seed_filing(db)
     seed_summaries(db, filing_id, ["business", "mdna"])

@@ -14,7 +14,7 @@ from apps.api.edgar.client import CompanyRef, FilingRef
 # Known cost: extract_sections also parses the HTML internally, so each ingest
 # parses twice; a single parse would need the extractor to expose its text.
 from apps.api.edgar.sections import _html_to_text, extract_sections
-from apps.api.research.repository import Repository
+from apps.api.research.repository import Repository, ResearchView
 from apps.api.research.summarizer import Summarizer
 
 _logger = logging.getLogger(__name__)
@@ -210,31 +210,24 @@ class ResearchService:
                 "%s %s: %s", company.ticker, filing.accession_number, warning.describe()
             )
 
-        summaries: dict[str, str] = {}
-        for section, section_text in sections.items():
-            try:
-                summaries[section] = self._summarizer.summarize(
-                    section, section_text, filing.filing_url
-                )
-            except anthropic.APIError as exc:
-                raise UpstreamError("anthropic", str(exc)) from exc
-
-        thesis = compose_thesis(company, filing, summaries)
-
+        # ADR-0014 §1/§2/§6: ingest makes ZERO answer-model calls. Each section's
+        # source_text lands EAGERLY (retrieval reads it via
+        # sections_pending_embedding — load-bearing), with the summary left
+        # PENDING (NULL). No thesis is composed here; it is composed lazily at
+        # first demand (summarize_on_demand) from the summaries computed then, so
+        # the eager answer-model spend is not re-introduced through the thesis.
         with self._engine.begin() as conn:
             repo = Repository(conn)
             company_id = repo.upsert_company(company.ticker, company.cik, company.name)
             filing_id = repo.insert_filing(company_id, filing, content_sha256)
-            for section, summary in summaries.items():
-                repo.insert_summary(
+            for section, section_text in sections.items():
+                repo.insert_pending_summary(
                     filing_id,
                     section,
-                    summary,
-                    source_text=sections[section],
+                    source_text=section_text,
                     source_url=filing.filing_url,
                     model=self._summarizer.model,
                 )
-            snapshot_id = repo.insert_thesis_snapshot(company_id, filing_id, thesis)
 
         return ResearchOutcome(
             status="ingested",
@@ -242,7 +235,80 @@ class ResearchService:
             filing_id=filing_id,
             accession_number=filing.accession_number,
             filing_url=filing.filing_url,
-            summaries=summaries,
-            thesis_snapshot_id=snapshot_id,
+            summaries={},  # nothing computed at ingest (§1); sections are pending
+            thesis_snapshot_id=None,  # thesis composed lazily at first demand (§6)
             section_warnings=section_warnings,
+        )
+
+    def summarize_on_demand(self, ticker: str) -> ResearchView | None:
+        """ADR-0014 §3: the ONE place a summary is computed. On read of the
+        summary surface, compute each PENDING section inline via the summarizer,
+        cache it in place (UPDATE the existing row — never INSERT, the row already
+        exists from the eager source_text write), compose the thesis on first
+        demand (append-only), and return the view. A second read is a cache hit
+        with zero summarizer calls. Demand is this explicit surface only — never
+        QA/FIND/COMPARE/change-detection, which read filing_chunks."""
+        with self._engine.connect() as conn:
+            latest = Repository(conn).latest_filing(ticker)
+        if latest is None:
+            return None
+        with self._engine.connect() as conn:
+            stored = Repository(conn).stored_summaries(latest.filing_id)
+
+        # Compute pending sections BEFORE opening the write transaction, mirroring
+        # the ingest/repair posture: a summarizer failure writes nothing.
+        computed: dict[str, str] = {}
+        for section, entry in stored.items():
+            if entry.summary is None:
+                try:
+                    computed[section] = self._summarizer.summarize(
+                        section, entry.source_text, entry.source_url
+                    )
+                except anthropic.APIError as exc:
+                    raise UpstreamError("anthropic", str(exc)) from exc
+        if computed:
+            with self._engine.begin() as conn:
+                repo = Repository(conn)
+                for section, summary in computed.items():
+                    repo.fill_summary(
+                        latest.filing_id, section, summary=summary, model=self._summarizer.model
+                    )
+
+        summaries: dict[str, str] = {}
+        for section, entry in stored.items():
+            value = computed.get(section, entry.summary)
+            assert value is not None  # every pending section was just computed above
+            summaries[section] = value
+
+        with self._engine.connect() as conn:
+            thesis = Repository(conn).latest_thesis_for_filing(latest.company_id, latest.filing_id)
+        if thesis is None:
+            company = CompanyRef(ticker=latest.ticker, cik=latest.cik, name=latest.company_name)
+            filing = FilingRef(
+                accession_number=latest.accession_number,
+                form_type=latest.form_type,
+                filing_date=latest.filing_date,
+                period_end_date=latest.period_end_date,
+                filing_url=latest.filing_url,
+            )
+            thesis_content = compose_thesis(company, filing, summaries)
+            with self._engine.begin() as conn:
+                Repository(conn).insert_thesis_snapshot(
+                    latest.company_id, latest.filing_id, thesis_content
+                )
+            with self._engine.connect() as conn:
+                thesis = Repository(conn).latest_thesis_for_filing(
+                    latest.company_id, latest.filing_id
+                )
+            assert thesis is not None  # just inserted
+
+        return ResearchView(
+            ticker=latest.ticker,
+            company_name=latest.company_name,
+            accession_number=latest.accession_number,
+            filing_date=latest.filing_date,
+            filing_url=latest.filing_url,
+            summaries=summaries,
+            thesis=thesis[0],
+            thesis_created_at=thesis[1],
         )

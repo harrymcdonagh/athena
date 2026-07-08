@@ -92,10 +92,11 @@ python -m apps.api.research.embeddings   # embedding backfill
     only reminds; the judgment and the edit are yours — if nothing documented
     changed, say so and move on.
 
-## Current state (2026-07-07)
+## Current state (2026-07-08)
 
 - **Evidence layer complete and live through ADR-0012.** Ingestion →
-  summaries → embeddings → cited QA (ADR-0007) → temporal corpus (ADR-0008)
+  embeddings (per-filing summaries now lazy, ADR-0014 below) → cited QA
+  (ADR-0007) → temporal corpus (ADR-0008)
   → change detection with balanced per-period retrieval and mandatory
   both-period citation (ADR-0009) → `sec_ticker_reference` as an external SEC
   cache, distinct from `companies` (ADR-0010) → FIND cross-company mode with
@@ -103,6 +104,19 @@ python -m apps.api.research.embeddings   # embedding backfill
   from the f7c221a mock): CIK-deduped named set ≤5, refusal at cap,
   filing-pinned per-column synthesis, coverage counts, live-validated
   2026-07-07 (see Pending queue).
+- **Lazy on-demand summarisation landed** (ADR-0014, 7a20069): ingest no longer
+  summarises — it writes each section's `source_text` eagerly (the retrieval
+  substrate the embeddings backfill reads) and leaves `summary` NULL (pending).
+  `GET /companies/{ticker}/summary` is the SOLE compute surface: it summarises
+  pending sections inline via `ResearchService.summarize_on_demand`, caches them
+  in place (UPDATE guarded `WHERE summary IS NULL`), and composes the thesis
+  lazily on first demand; a second read is a cache hit. `POST /research/{ticker}`
+  NEVER computes — the "ingest never spends" invariant holds under every call
+  path. The eager ~$12–18/full-corpus summary spend is now conditional, paid
+  only on an explicit GET. Migration 0005 makes `filing_summaries.summary`
+  nullable; `source_text` stays NOT NULL. Live-validated against Postgres:
+  migration round-trips clean (0004↔0005), the 255 existing summary rows stay
+  non-pending, no duplicate-revision/multiple-heads error.
 - **Frontend landed** (12bc1a3, 2026-07-07): `apps/web` is a Vite + React + TS
   research terminal (find / research+compare / passages) over the local API;
   backend has narrow CORS for the Vite dev origin (e4acb4f). ADR-0002 amended
@@ -115,7 +129,8 @@ python -m apps.api.research.embeddings   # embedding backfill
   ticker diff also shows GOOGL — not absent: it shares Alphabet's CIK with
   GOOG, which is ingested (companies are keyed by CIK).
   Extraction repair f5f39ee re-embedded 13 corrupted filings; corpus clean.
-- **Tests:** 282 collected and passing (`pytest`, verified 2026-07-07).
+- **Tests:** 287 collected and passing (`pytest` with Postgres up, verified
+  2026-07-08); the DB-backed suite skips when Postgres is down.
 - **Batch ingestion** reports categorized failures (`unresolved`, `not_found`,
   `parse_error`, `rate_limited`, `other`) with the accounting invariant
   ingested + skipped + failed == attempted; section-plausibility warnings are
@@ -135,6 +150,12 @@ python -m apps.api.research.embeddings   # embedding backfill
   constants in compare.py. Open knob: `PASSAGES_PER_COMPANY_COMPARE` 2→3 if
   column omissions bite (k=8 diff found on-topic above-floor passages at
   ranks 3+).
+- **ADR-0014 lazy summarisation landed** on branch
+  `claude/lazy-filing-summarisation-413bgp` (7a20069 implementation + test
+  updates + this doc-sync), PR-to-main pending. Open follow-up (separate
+  commit): `repair.py` still re-summarises damaged sections inline — permitted
+  by ADR-0014 §6 (invalidate-or-re-summarise both allowed), but switching it to
+  invalidate-to-NULL would leave `GET summary` as the single compute surface.
 - **Push discipline:** commits may accumulate locally; check
   `git log origin/main..HEAD` before assuming origin is current.
 - **Frontend committed and pushed** (f21bc30 / e4acb4f / 12bc1a3): builds clean

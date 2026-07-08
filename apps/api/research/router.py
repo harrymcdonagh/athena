@@ -405,10 +405,15 @@ def run_research(
 
 @router.get("/companies/{ticker}/summary", response_model=SummaryResponse)
 def latest_summary(
-    ticker: str, engine: Annotated[Engine, Depends(get_read_engine)]
+    ticker: str, service: Annotated[ResearchService, Depends(get_research_service)]
 ) -> SummaryResponse:
-    with engine.connect() as conn:
-        view = Repository(conn).latest_research(ticker)
+    # ADR-0014 §3: this is the explicit summary surface — synchronous
+    # compute-on-read. A pending section is summarised inline, cached, and the
+    # thesis composed on first demand; a second read is a cache hit.
+    try:
+        view = service.summarize_on_demand(ticker)
+    except (UpstreamError, SummarizationError) as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     if view is None:
         raise HTTPException(status_code=404, detail=f"no research stored for {ticker!r}")
     return SummaryResponse(

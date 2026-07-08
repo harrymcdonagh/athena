@@ -106,7 +106,11 @@ class RepairCandidate:
 
 @dataclass(frozen=True)
 class StoredSummary:
-    summary: str
+    # ADR-0014: summary is None when the section is PENDING — source_text landed
+    # eagerly at ingest but the answer-model summary has not been demanded yet.
+    # None is an unambiguous pending marker: a real summary is always 300-500
+    # words (summarizer.py), never empty, never None.
+    summary: str | None
     source_text: str
     source_url: str
 
@@ -121,6 +125,26 @@ class ResearchView:
     summaries: dict[str, str]
     thesis: str
     thesis_created_at: datetime
+
+
+@dataclass(frozen=True)
+class LatestFiling:
+    """The latest filing for a ticker by period ordering (ADR-0008 §1/§4),
+    resolved WITHOUT a thesis-snapshot join — so the lazy summary surface
+    (ADR-0014 §3) can locate a company whose thesis has not been composed yet.
+    Carries the identity fields compose_thesis needs to reconstruct a
+    CompanyRef/FilingRef at demand time."""
+
+    company_id: int
+    cik: str
+    company_name: str
+    ticker: str
+    filing_id: int
+    accession_number: str
+    form_type: str
+    filing_date: date
+    period_end_date: date
+    filing_url: str
 
 
 class Repository:
@@ -188,6 +212,37 @@ class Repository:
                 "filing_id": filing_id,
                 "section": section,
                 "summary": summary,
+                "source_text": source_text,
+                "source_url": source_url,
+                "model": model,
+            },
+        ).scalar_one()
+        return result
+
+    def insert_pending_summary(
+        self,
+        filing_id: int,
+        section: str,
+        *,
+        source_text: str,
+        source_url: str,
+        model: str,
+    ) -> int:
+        """ADR-0014 §2: ingest writes source_text EAGERLY with the summary left
+        PENDING (NULL). Retrieval reads source_text (sections_pending_embedding),
+        so it must land at ingest; the answer-model summary is deferred to first
+        demand (fill_summary). `model` records the model that WILL summarise;
+        compute-on-read re-stamps it with the model actually used."""
+        result: int = self._conn.execute(
+            text(
+                "INSERT INTO filing_summaries"
+                " (filing_id, section, summary, source_text, source_url, model)"
+                " VALUES (:filing_id, :section, NULL, :source_text, :source_url, :model)"
+                " RETURNING id"
+            ),
+            {
+                "filing_id": filing_id,
+                "section": section,
                 "source_text": source_text,
                 "source_url": source_url,
                 "model": model,
@@ -558,6 +613,29 @@ class Repository:
         )
         return result.rowcount
 
+    def fill_summary(self, filing_id: int, section: str, *, summary: str, model: str) -> int:
+        """ADR-0014 §3: compute-on-read fills a PENDING summary in place —
+        UPDATE the existing (filing_id, section) row (created by
+        insert_pending_summary), never INSERT (UNIQUE (filing_id, section) would
+        reject that). The `summary IS NULL` guard makes the fill idempotent and
+        race-safe: a row already filled by a concurrent read is left untouched
+        (rowcount 0), and the caller uses the value already present. source_text
+        and source_url are NOT touched — the section text is unchanged, only its
+        summary is being computed for the first time."""
+        result = self._conn.execute(
+            text(
+                "UPDATE filing_summaries SET summary = :summary, model = :model"
+                " WHERE filing_id = :filing_id AND section = :section AND summary IS NULL"
+            ),
+            {
+                "summary": summary,
+                "model": model,
+                "filing_id": filing_id,
+                "section": section,
+            },
+        )
+        return result.rowcount
+
     def delete_chunks(self, filing_id: int, section: str) -> int:
         """Deleting a section's chunks is what queues it for the existing
         embeddings backfill (sections_pending_embedding); repair never embeds."""
@@ -595,6 +673,10 @@ class Repository:
         ).one_or_none()
         if row is None:
             return None
+        # A thesis snapshot only exists once summaries were composed from
+        # non-pending sections (ADR-0014 §6), so every summary here is non-NULL;
+        # the `is not None` filter both narrows the type and keeps a stray
+        # pending section honestly absent rather than rendered blank.
         summaries = {
             section: summary
             for section, summary in self._conn.execute(
@@ -604,6 +686,7 @@ class Repository:
                 ),
                 {"filing_id": row.filing_id},
             )
+            if summary is not None
         }
         return ResearchView(
             ticker=row.ticker,
@@ -615,3 +698,53 @@ class Repository:
             thesis=row.content,
             thesis_created_at=row.created_at,
         )
+
+    def latest_filing(self, ticker: str) -> LatestFiling | None:
+        """The latest filing for a ticker by period ordering (ADR-0008 §1/§4),
+        with NO thesis-snapshot dependency — so the lazy summary surface can
+        locate a company whose thesis has not been composed yet (ADR-0014 §3)."""
+        row = self._conn.execute(
+            text(
+                "SELECT c.id AS company_id, c.cik, c.name, c.ticker,"
+                " f.id AS filing_id, f.accession_number, f.form_type,"
+                " f.filing_date, f.period_end_date, f.filing_url"
+                " FROM companies c"
+                " JOIN filings f ON f.company_id = c.id"
+                " WHERE upper(c.ticker) = upper(:ticker)"
+                " ORDER BY f.period_end_date DESC, f.filing_date DESC,"
+                " f.accession_number DESC LIMIT 1"
+            ),
+            {"ticker": ticker},
+        ).one_or_none()
+        if row is None:
+            return None
+        return LatestFiling(
+            company_id=row.company_id,
+            cik=row.cik,
+            company_name=row.name,
+            ticker=row.ticker,
+            filing_id=row.filing_id,
+            accession_number=row.accession_number,
+            form_type=row.form_type,
+            filing_date=row.filing_date,
+            period_end_date=row.period_end_date,
+            filing_url=row.filing_url,
+        )
+
+    def latest_thesis_for_filing(
+        self, company_id: int, filing_id: int
+    ) -> tuple[str, datetime] | None:
+        """The most recent thesis snapshot for a filing, or None if none has been
+        composed yet (ADR-0014 §6: composed lazily at first demand, append-only —
+        a later repaired snapshot supersedes an earlier one, so take the latest)."""
+        row = self._conn.execute(
+            text(
+                "SELECT content, created_at FROM thesis_snapshots"
+                " WHERE company_id = :company_id AND source_filing_id = :filing_id"
+                " ORDER BY created_at DESC, id DESC LIMIT 1"
+            ),
+            {"company_id": company_id, "filing_id": filing_id},
+        ).one_or_none()
+        if row is None:
+            return None
+        return (row.content, row.created_at)
