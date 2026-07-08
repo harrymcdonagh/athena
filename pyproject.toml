@@ -30,6 +30,15 @@ dev = [
     "ruff>=0.5",
     "mypy>=1.10",
 ]
+# ADR-0013: the FIND cross-encoder reranker. A heavy dependency (torch) kept
+# out of the base and dev installs on purpose, so the test suite / CI never
+# pays the torch tax. Reranking is OFF by default and opt-in per request, so the
+# default FIND path never needs this. Install with `pip install -e '.[rerank]'`
+# to enable the opt-in path; opting in (rerank=true) without it raises a clear
+# error naming this extra — there is no silent cosine fallback.
+rerank = [
+    "sentence-transformers>=3.0",
+]
 
 [tool.ruff]
 line-length = 100

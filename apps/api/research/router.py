@@ -33,6 +33,7 @@ from apps.api.research.qa import (
     detect_changes,
 )
 from apps.api.research.repository import Repository
+from apps.api.research.rerank import RerankUnavailableError
 from apps.api.research.service import (
     ResearchService,
     UnsupportedFilingTypeError,
@@ -148,6 +149,10 @@ class FindPassageResponse(BaseModel):
     snippet: str
     source_url: str
     similarity: float
+    # Cross-encoder query-relevance of this passage (ADR-0013), null when
+    # reranking is disabled. A retrieval fact like `similarity`, not a company
+    # judgment; surfaced so the rerank effect is auditable.
+    rerank_score: float | None = None
 
 
 class FindCompanyMatchResponse(BaseModel):
@@ -440,16 +445,23 @@ def find(
     q: str,
     engine: Annotated[Engine, Depends(get_read_engine)],
     embedder: Annotated[Embedder, Depends(get_embedder)],
+    rerank: bool = False,
 ) -> FindResponse:
     # No answerer dependency on purpose (ADR-0011 §1): FIND composes its
-    # result purely from retrieval output. Caps are the find module's
-    # structural constants (ADR-0011 §3) — deliberately not request knobs.
+    # result purely from retrieval output. The structural caps (ADR-0011 §3)
+    # are deliberately NOT request knobs. `rerank` is the one exception: a
+    # cost/precision toggle, off by default so FIND stays cheap (~270 ms), which
+    # a caller flips true to pay the ~3 s cross-encoder pass (ADR-0013 §5).
     try:
-        result = find_companies(engine, embedder, q)
+        result = find_companies(engine, embedder, q, rerank_enabled=rerank)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except EmbeddingError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except RerankUnavailableError as exc:
+        # Opted into rerank without the [rerank] extra installed — a clear,
+        # actionable 503, never a raw 500 or a silent cosine swap (ADR-0013 §5).
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     return FindResponse(
         query=result.query,
         matches=[

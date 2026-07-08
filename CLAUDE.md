@@ -115,7 +115,7 @@ python -m apps.api.research.embeddings   # embedding backfill
   ticker diff also shows GOOGL — not absent: it shares Alphabet's CIK with
   GOOG, which is ingested (companies are keyed by CIK).
   Extraction repair f5f39ee re-embedded 13 corrupted filings; corpus clean.
-- **Tests:** 264 collected and passing (`pytest`, verified 2026-07-07).
+- **Tests:** 282 collected and passing (`pytest`, verified 2026-07-07).
 - **Batch ingestion** reports categorized failures (`unresolved`, `not_found`,
   `parse_error`, `rate_limited`, `other`) with the accounting invariant
   ingested + skipped + failed == attempted; section-plausibility warnings are
@@ -142,12 +142,18 @@ python -m apps.api.research.embeddings   # embedding backfill
   strict-TS compile is the gate. Follow-ups if pursued: env-configurable API
   base is present (`VITE_API_BASE_URL`) but there is no production build/deploy
   story yet, and no frontend tests.
+- **FIND cross-encoder rerank landed** (ADR-0013, opt-in): local
+  `cross-encoder/ms-marco-MiniLM-L-6-v2` reranks FIND candidates by
+  query-relevance, fixing bi-encoder off-topic-best-chunk noise (validated:
+  SCHW/cyber, ORCL/AI demoted). OFF BY DEFAULT / opt-in per request
+  (`?rerank=true`) — it costs ~3 s/query on CPU, so FIND's cheap path stays
+  ~270 ms; the `[rerank]` extra (`sentence-transformers`) is optional and the
+  suite runs torch-free without it (opting in without it raises a clear error).
 - **Backlog:** S&P 500 breadth run (deferred by choice, ADR-0010/0011);
   incorporation-by-reference extractor for the 16 missing filers; content
-  dedupe for FIND; cross-encoder reranker (only if precision at the margin
-  matters); semantic-support check (ADR-0007's deferred enforcement); daily
-  briefing (ADR-0011 is its substrate); judgment layer (own ADR, behind the
-  wall).
+  dedupe for FIND; semantic-support check (ADR-0007's deferred enforcement);
+  daily briefing (ADR-0011 is its substrate); judgment layer (own ADR, behind
+  the wall).
 
 ## Stack
 

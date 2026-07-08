@@ -7,6 +7,22 @@ from alembic.config import Config as AlembicConfig
 from sqlalchemy import Engine, create_engine, text
 from sqlalchemy.exc import OperationalError
 
+import apps.api.research.find as find_module
+
+
+@pytest.fixture(autouse=True)
+def _rerank_disabled_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """ADR-0013: the reranker ships default ON, but the test suite must never
+    import torch (the ~hundreds-of-MB sentence-transformers/torch dependency).
+    Force FIND's rerank flag OFF for every test so no test path triggers the
+    lazy model load; the existing find/router tests then exercise the exact
+    pre-rerank cosine behavior, which is also the runtime fallback when the
+    dependency is absent. The dedicated rerank tests opt back IN by passing
+    rerank_enabled=True with an injected STUB scorer, so the ON path is
+    exercised deterministically — never against real torch."""
+    monkeypatch.setattr(find_module, "RERANK_ENABLED", False)
+
+
 TEST_DATABASE_URL = os.environ.get(
     "ATHENA_TEST_DATABASE_URL",
     "postgresql+psycopg://athena:athena@localhost:5433/athena_test",

@@ -764,9 +764,50 @@ def test_find_path_is_structurally_zero_answer_model(search_client: TestClient, 
 
     assert response.status_code == 200
     assert response.json()["matches"]
-    assert set(inspect.signature(find_endpoint).parameters) == {"q", "engine", "embedder"}
+    # `rerank` (ADR-0013 §5) is a cost/precision toggle, off by default; still
+    # no answerer dependency in the endpoint surface.
+    assert set(inspect.signature(find_endpoint).parameters) == {"q", "engine", "embedder", "rerank"}
     assert not any("answerer" in name.lower() for name in vars(find_module))
     assert not any("anthropic" in name.lower() for name in vars(find_module))
+    # ADR-0013: FIND now imports the reranker; it too must be answerer-free, so
+    # the zero-answer-model contract survives the new import edge.
+    import apps.api.research.rerank as rerank_module
+
+    assert not any("answerer" in name.lower() for name in vars(rerank_module))
+    assert not any("anthropic" in name.lower() for name in vars(rerank_module))
+
+
+def test_find_default_path_does_not_rerank(search_client: TestClient, db: Engine) -> None:
+    """ADR-0013 §5: rerank is OFF by default. A plain FIND request must leave
+    every rerank_score null (the cheap cosine path), proving the feature is
+    inert unless explicitly opted into."""
+    seed_search_corpus(db)
+    body = search_client.get("/research/find", params={"q": "revenue growth"}).json()
+    assert body["matches"]
+    for match in body["matches"]:
+        for passage in match["passages"]:
+            assert passage["rerank_score"] is None
+
+
+def test_find_rerank_opt_in_without_extra_returns_clear_503(
+    search_client: TestClient, db: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ADR-0013 §5: opting in (?rerank=true) without the [rerank] extra returns a
+    clear 503 naming the extra — never a raw 500, never a silent cosine swap.
+    Torch-free: the missing dependency is simulated by forcing the lazy import
+    to fail."""
+    import sys
+
+    import apps.api.research.rerank as rerank_module
+
+    seed_search_corpus(db)
+    monkeypatch.setattr(rerank_module, "_scorer_singleton", None)
+    monkeypatch.setitem(sys.modules, "sentence_transformers", None)  # -> ImportError
+
+    response = search_client.get("/research/find", params={"q": "growth", "rerank": "true"})
+
+    assert response.status_code == 503
+    assert "[rerank]" in response.json()["detail"]
 
 
 def test_find_response_cannot_carry_a_ranking_or_synthesis(

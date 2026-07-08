@@ -1,4 +1,5 @@
 import math
+from typing import Any
 
 import pytest
 from sqlalchemy import Engine
@@ -13,6 +14,7 @@ from apps.api.research.find import (
     find_companies,
 )
 from apps.api.research.repository import ChunkMatch, Repository
+from apps.api.research.rerank import Scorer
 from apps.api.tests.test_embeddings import (
     FakeEmbedder,
     QueryOnlyEmbedder,
@@ -206,12 +208,13 @@ def test_find_rejects_non_positive_caps(db: Engine) -> None:
     """passages_per_company=0 would otherwise crash on passages[0] when
     computing match_strength; a zero candidate_n would silently return
     nothing. Both are caller errors, reported as such."""
-    for kwargs in (
+    cases: tuple[dict[str, Any], ...] = (
         {"wide_search_limit": 0},
         {"candidate_n": 0},
         {"passages_per_company": 0},
         {"passages_per_company": -1},
-    ):
+    )
+    for kwargs in cases:
         with pytest.raises(ValueError, match="positive"):
             find_companies(db, FakeEmbedder(), "tariffs", **kwargs)
 
@@ -222,3 +225,119 @@ def test_find_default_caps_are_bounded() -> None:
     assert 1 <= CANDIDATE_N <= 25
     assert 1 <= PASSAGES_PER_COMPANY <= 10
     assert 1 <= WIDE_SEARCH_LIMIT <= 100
+
+
+# --- FIND reranking (ADR-0013): wiring over the funnel, stub scorer only ---
+#
+# The conftest autouse fixture forces RERANK_ENABLED off for the suite, so
+# these tests opt back IN by passing rerank_enabled=True and an injected STUB
+# scorer — the ON path is exercised deterministically, never against torch.
+
+
+def keyword_scorer(keyword: str) -> Scorer:
+    """Stub cross-encoder: 1.0 if keyword in the passage text, else 0.0."""
+
+    def score(query: str, texts: list[str]) -> list[float]:
+        return [1.0 if keyword in text else 0.0 for text in texts]
+
+    return score
+
+
+def test_find_rerank_applies_the_cap_to_the_reranked_order(db: Engine) -> None:
+    """ADR-0013 §3: the PASSAGES_PER_COMPANY cap applies AFTER reranking, so the
+    reranker changes WHICH passage survives. The on-topic chunk survives the
+    cap of 1 even though its cosine is the lowest of the three."""
+    aapl = seed_filing(db)
+    seed_company_chunks(
+        db,
+        aapl,
+        [
+            ("apple off topic filler", blend_vector(0.9)),  # highest cosine
+            ("apple cyber breach risk", blend_vector(0.3)),  # lowest cosine, on-topic
+            ("apple more filler", blend_vector(0.6)),
+        ],
+    )
+
+    result = find_companies(
+        db,
+        QueryOnlyEmbedder(axis_vector(0)),
+        "cyber",
+        passages_per_company=1,
+        rerank_enabled=True,
+        scorer=keyword_scorer("cyber"),
+    )
+
+    (match,) = result.matches
+    assert [p.snippet for p in match.passages] == ["apple cyber breach risk"]
+    assert match.passages[0].rerank_score == 1.0
+    # The passage's own cosine is preserved, NOT overwritten by rerank.
+    assert match.passages[0].similarity == pytest.approx(0.3, abs=1e-6)
+    # match_strength stays the MAX cosine over the company's chunks (0.9) — the
+    # original retrieval fact, untouched by the reorder (ADR-0013 §4).
+    assert match.match_strength == pytest.approx(0.9, abs=1e-6)
+
+
+def test_find_rerank_drops_off_topic_best_company_in_the_ordering(db: Engine) -> None:
+    """ADR-0013 §4 cross-set effect: a company whose highest-cosine chunk is
+    off-topic (the SCHW/EMR symptom) falls below a company with a genuinely
+    on-topic passage, even though its cosine is higher. match_strength is
+    preserved as the original retrieval fact, keeping the demotion auditable."""
+    aapl = seed_filing(db)
+    msft = seed_second_company_filing(db)
+    seed_company_chunks(
+        db,
+        aapl,
+        [
+            ("apple high cosine off topic", blend_vector(0.95)),
+            ("apple more off topic", blend_vector(0.7)),
+        ],
+    )
+    seed_company_chunks(
+        db,
+        msft,
+        [("microsoft cyber incident", blend_vector(0.6)), ("microsoft filler", blend_vector(0.2))],
+    )
+
+    result = find_companies(
+        db,
+        QueryOnlyEmbedder(axis_vector(0)),
+        "cyber",
+        rerank_enabled=True,
+        scorer=keyword_scorer("cyber"),
+    )
+
+    # MSFT floats above AAPL despite AAPL's higher cosine: AAPL is off-topic.
+    assert [m.ticker for m in result.matches] == ["MSFT", "AAPL"]
+    assert result.matches[0].passages[0].snippet == "microsoft cyber incident"
+    assert result.matches[0].passages[0].rerank_score == 1.0
+    # Original max-cosine retrieval facts preserved on both, unchanged by order.
+    assert result.matches[0].match_strength == pytest.approx(0.6, abs=1e-6)
+    assert result.matches[1].match_strength == pytest.approx(0.95, abs=1e-6)
+
+
+def test_find_rerank_disabled_keeps_cosine_order_and_leaves_scores_none(db: Engine) -> None:
+    """The default suite path (rerank off via the conftest fixture) is exactly
+    the pre-rerank behavior: cosine order, every rerank_score None."""
+    aapl = seed_filing(db)
+    seed_company_chunks(
+        db, aapl, [("apple off topic", blend_vector(0.9)), ("apple cyber", blend_vector(0.3))]
+    )
+
+    result = find_companies(db, QueryOnlyEmbedder(axis_vector(0)), "cyber")
+
+    (match,) = result.matches
+    assert [p.snippet for p in match.passages] == ["apple off topic", "apple cyber"]
+    assert all(p.rerank_score is None for p in match.passages)
+
+
+def test_find_and_rerank_import_no_answerer() -> None:
+    """ADR-0011 §1 + ADR-0013: FIND's rerank import must not breach the
+    zero-answer-model contract. (Torch-laziness of the reranker is asserted in
+    test_rerank.test_importing_the_rerank_module_is_torch_lazy; note find.py
+    transitively imports voyageai, which may pull torch independently of the
+    reranker, so a global torch check does not belong here.)"""
+    import apps.api.research.rerank as rerank_module
+
+    for module in (find_module, rerank_module):
+        assert not any("answerer" in name.lower() for name in vars(module))
+        assert not any("anthropic" in name.lower() for name in vars(module))
