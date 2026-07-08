@@ -291,12 +291,19 @@ def _audit_one(
         return failed(exc)
 
     # Unaffected sections reuse their stored summaries; only damaged sections
-    # carry the new ones into the appended snapshot.
-    merged = {
+    # carry the new ones into the appended snapshot. ADR-0014: an unaffected
+    # section may be PENDING (summary NULL) — a valid state, not an error. A
+    # thesis is composed only when every section has a summary; if any is still
+    # pending, the repaired source_text is written but the thesis stays deferred
+    # to first demand (summarize_on_demand), not re-introduced eagerly here.
+    merged: dict[str, str | None] = {
         section: repaired_summaries.get(section, stored[section].summary) for section in fresh
     }
+    complete = {section: value for section, value in merged.items() if value is not None}
     company = CompanyRef(ticker=candidate.ticker, cik=candidate.cik, name=candidate.company_name)
-    thesis = compose_repaired_thesis(company, filing, merged)
+    thesis = (
+        compose_repaired_thesis(company, filing, complete) if len(complete) == len(merged) else None
+    )
     try:
         with engine.begin() as conn:
             repo = Repository(conn)
@@ -314,7 +321,8 @@ def _audit_one(
                         f" section {diff.section!r}, updated {updated}"
                     )
                 repo.delete_chunks(candidate.filing_id, diff.section)
-            repo.insert_thesis_snapshot(candidate.company_id, candidate.filing_id, thesis)
+            if thesis is not None:
+                repo.insert_thesis_snapshot(candidate.company_id, candidate.filing_id, thesis)
     except Exception as exc:
         return failed(exc)
     return FilingAuditResult(

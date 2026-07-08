@@ -69,6 +69,7 @@ from apps.api.tests.test_service import (
     FILING,
     FRACTION_TRIP_HTML,
     PRIOR_FILING,
+    CountingSummarizer,
     FakeEdgar,
     FakeSummarizer,
     FixedDocumentEdgar,
@@ -89,14 +90,17 @@ def client(db: Engine) -> Iterator[TestClient]:
     app.dependency_overrides.clear()
 
 
-def test_post_research_returns_summaries_and_ids(client: TestClient) -> None:
+def test_post_research_ingests_with_pending_summaries(client: TestClient) -> None:
+    # ADR-0014: ingest computes no summaries, so the ingested response carries an
+    # empty summaries map — sections are pending until the summary surface is hit.
     response = client.post("/research/AAPL")
     assert response.status_code == 200
     body = response.json()
     assert body["ticker"] == "AAPL"
     assert body["status"] == "ingested"
     assert body["accession_number"] == "0000320193-25-000123"
-    assert set(body["summaries"]) == {"business", "risk_factors", "mdna"}
+    assert body["summaries"] == {}
+    assert body["thesis_snapshot_id"] is None
     assert body["filing_url"].startswith("https://www.sec.gov/")
 
 
@@ -184,6 +188,28 @@ def test_post_research_unknown_ticker_returns_404(client: TestClient, db: Engine
     service = ResearchService(edgar=UnknownTickerEdgar(), summarizer=FakeSummarizer(), engine=db)
     app.dependency_overrides[get_research_service] = lambda: service
     assert client.post("/research/ZZZZ").status_code == 404
+
+
+def test_get_summary_computes_on_read_then_serves_cached(db: Engine) -> None:
+    # ADR-0014 §3: the summary endpoint is the ONLY place summaries compute.
+    # First GET computes+caches (one call/section); the second is a cache hit.
+    summarizer = CountingSummarizer()
+    service = ResearchService(edgar=FakeEdgar(), summarizer=summarizer, engine=db)
+    app.dependency_overrides[get_research_service] = lambda: service
+    client = TestClient(app)
+
+    client.post("/research/AAPL")  # ingest: pending, zero summarizer calls
+    assert summarizer.calls == []
+
+    first = client.get("/companies/AAPL/summary")
+    assert first.status_code == 200
+    assert set(first.json()["summaries"]) == {"business", "risk_factors", "mdna"}
+    assert sorted(summarizer.calls) == ["business", "mdna", "risk_factors"]
+
+    second = client.get("/companies/AAPL/summary")
+    assert second.status_code == 200
+    assert second.json()["summaries"] == first.json()["summaries"]
+    assert len(summarizer.calls) == 3  # cache hit — no recompute
 
 
 def test_get_summary_after_research(client: TestClient) -> None:

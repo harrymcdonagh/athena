@@ -120,6 +120,19 @@ class FakeSummarizer:
         return f"[{section}] summary. Source: {source_url}"
 
 
+class CountingSummarizer(FakeSummarizer):
+    """Records every summarize() call so a test can assert ingest makes ZERO
+    calls (ADR-0014 §1) and compute-on-read makes exactly one per pending
+    section (§3)."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def summarize(self, section: str, text: str, source_url: str) -> str:
+        self.calls.append(section)
+        return super().summarize(section, text, source_url)
+
+
 class ExplodingSummarizer(FakeSummarizer):
     def summarize(self, section: str, text: str, source_url: str) -> str:
         raise UpstreamError("anthropic", "boom")
@@ -137,16 +150,21 @@ def count(db: Engine, table: str) -> int:
     return result
 
 
-def test_run_persists_everything(db: Engine) -> None:
+def test_ingest_persists_source_text_eagerly_and_leaves_summaries_pending(db: Engine) -> None:
+    # ADR-0014 §1/§2: ingest writes source_text for all 3 sections (retrieval
+    # reads it) but computes NO summaries and composes NO thesis. This is the
+    # proof the bleeding stopped — the single most important assertion is the
+    # ZERO summarizer calls (see test_ingest_makes_zero_summarizer_calls).
     service = ResearchService(edgar=FakeEdgar(), summarizer=FakeSummarizer(), engine=db)
     outcome = service.run("AAPL")
 
     assert outcome.status == "ingested"
-    assert set(outcome.summaries) == {"business", "risk_factors", "mdna"}
+    assert outcome.summaries == {}  # nothing computed at ingest; sections pending
+    assert outcome.thesis_snapshot_id is None  # thesis composed lazily on demand
     assert count(db, "companies") == 1
     assert count(db, "filings") == 1
     assert count(db, "filing_summaries") == 3
-    assert count(db, "thesis_snapshots") == 1
+    assert count(db, "thesis_snapshots") == 0
     with db.connect() as conn:
         stored_model = conn.execute(
             text("SELECT DISTINCT model FROM filing_summaries")
@@ -154,8 +172,54 @@ def test_run_persists_everything(db: Engine) -> None:
         source_text = conn.execute(
             text("SELECT source_text FROM filing_summaries WHERE section = 'business'")
         ).scalar_one()
-    assert stored_model == "fake-model"
+        pending = conn.execute(
+            text("SELECT count(*) FROM filing_summaries WHERE summary IS NULL")
+        ).scalar_one()
+    assert stored_model == "fake-model"  # the model that WILL summarise, stamped eagerly
     assert "Revenue was $391,035 million" in source_text
+    assert pending == 3  # all three sections pending until demanded
+
+
+def test_ingest_makes_zero_summarizer_calls(db: Engine) -> None:
+    summarizer = CountingSummarizer()
+    service = ResearchService(edgar=FakeEdgar(), summarizer=summarizer, engine=db)
+
+    service.run("AAPL")
+
+    assert summarizer.calls == []  # the whole point of ADR-0014: no eager spend
+
+
+def test_summarize_on_demand_computes_once_then_caches(db: Engine) -> None:
+    summarizer = CountingSummarizer()
+    service = ResearchService(edgar=FakeEdgar(), summarizer=summarizer, engine=db)
+    service.run("AAPL")
+    assert count(db, "thesis_snapshots") == 0
+
+    view = service.summarize_on_demand("AAPL")
+
+    assert view is not None
+    assert set(view.summaries) == {"business", "risk_factors", "mdna"}
+    assert sorted(summarizer.calls) == ["business", "mdna", "risk_factors"]  # one per section
+    # UPDATE-in-place, not INSERT: still exactly 3 rows, now all non-pending.
+    assert count(db, "filing_summaries") == 3
+    with db.connect() as conn:
+        pending = conn.execute(
+            text("SELECT count(*) FROM filing_summaries WHERE summary IS NULL")
+        ).scalar_one()
+    assert pending == 0
+    assert count(db, "thesis_snapshots") == 1  # thesis composed on first demand
+
+    second = service.summarize_on_demand("AAPL")
+
+    assert second is not None
+    assert second.summaries == view.summaries
+    assert len(summarizer.calls) == 3  # cache hit: NO further summarizer calls
+    assert count(db, "thesis_snapshots") == 1  # append-only, not recomposed
+
+
+def test_summarize_on_demand_unknown_ticker_returns_none(db: Engine) -> None:
+    service = ResearchService(edgar=FakeEdgar(), summarizer=FakeSummarizer(), engine=db)
+    assert service.summarize_on_demand("ZZZZ") is None
 
 
 def test_rerun_same_filing_is_skipped_noop(db: Engine) -> None:
@@ -258,25 +322,31 @@ def test_run_rejects_missing_period_end_date(db: Engine) -> None:
     assert count(db, "filings") == 0
 
 
-def test_summarizer_failure_persists_nothing(db: Engine) -> None:
+def test_summarize_on_demand_failure_leaves_sections_pending(db: Engine) -> None:
+    # Ingest makes ZERO summarizer calls, so it succeeds even with an exploding
+    # summarizer; the failure surfaces on demand and writes nothing — pending
+    # stays pending (honest absence), no thesis composed.
     service = ResearchService(edgar=FakeEdgar(), summarizer=ExplodingSummarizer(), engine=db)
+    service.run("AAPL")
+    assert count(db, "filing_summaries") == 3
+
     with pytest.raises(UpstreamError):
-        service.run("AAPL")
-    assert count(db, "companies") == 0
-    assert count(db, "filings") == 0
-    assert count(db, "filing_summaries") == 0
+        service.summarize_on_demand("AAPL")
+
+    with db.connect() as conn:
+        pending = conn.execute(
+            text("SELECT count(*) FROM filing_summaries WHERE summary IS NULL")
+        ).scalar_one()
+    assert pending == 3
     assert count(db, "thesis_snapshots") == 0
 
 
-def test_anthropic_error_is_wrapped_as_upstream_error(db: Engine) -> None:
+def test_summarize_on_demand_wraps_anthropic_error_as_upstream(db: Engine) -> None:
     service = ResearchService(edgar=FakeEdgar(), summarizer=AnthropicErrorSummarizer(), engine=db)
+    service.run("AAPL")
     with pytest.raises(UpstreamError) as exc:
-        service.run("AAPL")
+        service.summarize_on_demand("AAPL")
     assert exc.value.source == "anthropic"
-    assert count(db, "companies") == 0
-    assert count(db, "filings") == 0
-    assert count(db, "filing_summaries") == 0
-    assert count(db, "thesis_snapshots") == 0
 
 
 # --- section-plausibility guard (flag-not-block) ---
@@ -323,7 +393,7 @@ def test_low_fraction_section_warns_and_is_still_stored(db: Engine) -> None:
             text("SELECT source_text FROM filing_summaries WHERE section = 'mdna'")
         ).scalar_one()
     assert "m" * 100 in stored
-    assert count(db, "thesis_snapshots") == 1
+    assert count(db, "thesis_snapshots") == 0  # ADR-0014: thesis composed on demand, not ingest
 
 
 def test_section_under_absolute_floor_warns_and_is_still_stored(db: Engine) -> None:
