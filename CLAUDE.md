@@ -126,6 +126,19 @@ python -m apps.api.research.embeddings   # embedding backfill
   company-summary delta is trivial at lazy per-demand volumes. One-line
   revertible; REOPEN on a bulk-resummarise event (deferred S&P 500 breadth run,
   hundreds × $0.15) → re-run the A/B then.
+- **Judgment layer opened — ADR-0016 Accepted (2026-07-08), build pending.**
+  First deliberate crossing of the evidence/judgment wall (ADR-0007 §3): a
+  single-name, decision-SUPPORT valuation snapshot over FMP (Premium key) —
+  structured numbers in, a cited judgment-labelled snapshot out; the answer
+  model NEVER sees a filing (the cheap path). 9 decisions, incl. a mandatory
+  `layer:"judgment"` label carried in the return type; a `Dated`/`Fetched`
+  provenance split (self-dated key-metrics/ratios/dcf vs fetch-stamped live
+  snapshots incl. the -ttm endpoints); DCF-vs-consensus-vs-price shown side by
+  side, never blended; identity-only peers (no peer-median over FMP's noisy
+  set); and an FY-primary / TTM-secondary current multiple. Schema-captured
+  live against AAPL fixtures (`tests/fixtures/fmp/`; history depth 20yr
+  FY2006–2025 at `limit=20`). Docs-only so far — NO module yet; review evidence
+  in `0016-…-REVIEW.md` (3 rounds). Build is a later session.
 - **Frontend landed** (12bc1a3, 2026-07-07): `apps/web` is a Vite + React + TS
   research terminal (find / research+compare / passages) over the local API;
   backend has narrow CORS for the Vite dev origin (e4acb4f). ADR-0002 amended
@@ -165,6 +178,13 @@ python -m apps.api.research.embeddings   # embedding backfill
   commit): `repair.py` still re-summarises damaged sections inline — permitted
   by ADR-0014 §6 (invalidate-or-re-summarise both allowed), but switching it to
   invalidate-to-NULL would leave `GET summary` as the single compute surface.
+- **ADR-0016 valuation-snapshot build pending** (Accepted 2026-07-08, docs-only
+  on main): the increment-1 module is unbuilt. Next session builds it
+  mocked-build-then-review-then-apply — new `fmp_api_key` config + a narrow FMP
+  client with one named live-swap point, the `Dated`/`Fetched` provenance types,
+  and the identity-only / FY-primary contracts of ADR-0016. `scratch/fmp_schema_probe.py`
+  (throwaway) + `tests/fixtures/fmp/*_AAPL.json` are the schema-capture evidence;
+  live-validate the sparse-data absence path on a data-poor ticker (ADR-0016 M2).
 - **Push discipline:** commits may accumulate locally; check
   `git log origin/main..HEAD` before assuming origin is current.
 - **Frontend committed and pushed** (f21bc30 / e4acb4f / 12bc1a3): builds clean
