@@ -96,27 +96,37 @@ judgment layer.
    and `period_end_date` already encodes the period, so the sha/period identity
    the codebase relies on carries over unchanged.
 
-4. **Demand is a synchronous compute-on-read at the summary surface: compute
-   inline, cache, return — and it is never inferred from a QA/FIND/COMPARE
-   call.** On a request to the summary surface
-   (`GET /companies/{ticker}/summary`, and the `POST /research/{ticker}`
-   response if a caller asks it to return prose) for a section whose `summary`
-   is still pending, Athena computes that section's summary **inline within the
-   request**, writes it to the cache, and returns it in the same response: the
-   caller waits once, and every later read is a cache hit. Background/async
+4. **The SOLE summarisation-triggering surface is
+   `GET /companies/{ticker}/summary`; demand there is a synchronous
+   compute-on-read (compute inline, cache, return). No other call path — ingest
+   included — ever computes a summary.** On a `GET /companies/{ticker}/summary`
+   request for a section whose `summary` is still pending, Athena computes that
+   section's summary **inline within the request**, writes it to the cache, and
+   returns it in the same response: the caller waits once, and every later read
+   is a cache hit. **`POST /research/{ticker}` (the ingest call) NEVER computes
+   a summary** — regardless of whether it is hit by the batch runner or by a
+   human directly. If a filing's summaries are not cached yet, the POST response
+   reflects the **pending** state (`summary IS NULL`); it does not compute
+   inline. This makes "ingest never spends answer-model tokens" an **invariant
+   under all call paths**, not a usually: because ingest has exactly one
+   behaviour (store `source_text`, embed, never summarise), no way of invoking
+   it can move the eager bleed somewhere else — the guarantee cannot be defeated
+   by hitting the ingest endpoint directly. Demand is the explicit summary
+   surface, **never a side effect of any other call**. Background/async
    precomputation (a worker queue, a warm-the-cache job) is deliberately **out
    of scope** — a breadth-era follow-on; at the current corpus size synchronous
    compute-on-read is sufficient and keeps the control flow legible. Demand is
-   **not** a QA question, a FIND query, a COMPARE column, or a change-detection
-   run — those read `filing_chunks` and must continue to make **zero**
-   summarisation calls. This mirrors the explicit-not-inferred posture of the
-   compare flag (ADR-0009 §7: change detection is requested, never inferred from
-   question text) and the opt-in rerank flag (ADR-0013 §5): the expensive path
-   is entered by an explicit act, not guessed from a cheap one. The rejected
-   alternative — letting a QA call lazily trigger summarisation of whatever
-   filings it retrieved from — is refused: it reintroduces answer-model spend
-   into the cheap, frequent path and couples QA cost to corpus size, the exact
-   coupling this ADR removes.
+   likewise **not** a QA question, a FIND query, a COMPARE column, or a
+   change-detection run — those read `filing_chunks` and must continue to make
+   **zero** summarisation calls. This mirrors the explicit-not-inferred posture
+   of the compare flag (ADR-0009 §7: change detection is requested, never
+   inferred from question text) and the opt-in rerank flag (ADR-0013 §5): the
+   expensive path is entered by an explicit act, not guessed from a cheap one.
+   The rejected alternative — letting the ingest response, or a QA call, lazily
+   trigger summarisation of whatever filings it touched — is refused: it
+   reintroduces answer-model spend into a non-summary path and couples that
+   path's cost to corpus size, the exact coupling this ADR removes. That is
+   *moving* the bleeding, not *stopping* it.
 
 5. **A pending summary is `summary IS NULL`; the schema change is a nullable
    `summary` column, not a split table.** A not-yet-computed summary is a
@@ -243,10 +253,11 @@ For the guarantees to hold, each checked structurally where possible:
      demand path; must either compute-then-return or report honest absence,
      never assume a row's `summary` is present.
   2. `ResearchOutcome.summaries` and the `POST /research/{ticker}`
-     `ResearchResponse.summaries` field — at ingest this is now empty (nothing
-     computed yet); the response schema already tolerates `summaries={}` on the
-     `skipped` path, so the shape holds, but the `ingested` case now also
-     returns empty summaries.
+     `ResearchResponse.summaries` field — this call **never computes** (#4), so
+     at ingest it is empty/pending (nothing computed yet); the response schema
+     already tolerates `summaries={}` on the `skipped` path, so the shape holds,
+     and the `ingested` case now also returns empty summaries rather than
+     triggering a summarisation.
   3. `compose_thesis()` / `thesis_snapshots` — no longer written at ingest;
      `thesis_snapshots` remains append-only, so a lazily-composed thesis is a
      later append, consistent with the existing repair-appends-a-snapshot
