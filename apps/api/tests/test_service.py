@@ -236,7 +236,9 @@ def test_rerun_same_filing_is_skipped_noop(db: Engine) -> None:
     assert second.thesis_snapshot_id is None
     assert count(db, "filings") == 1
     assert count(db, "filing_summaries") == 3
-    assert count(db, "thesis_snapshots") == 1
+    # ADR-0014: ingest composes NO thesis; no GET summary demand was made, so
+    # the thesis stays lazy (0), not eagerly written at ingest.
+    assert count(db, "thesis_snapshots") == 0
 
 
 def test_run_with_accession_ingests_prior_year_filing(db: Engine) -> None:
@@ -251,7 +253,9 @@ def test_run_with_accession_ingests_prior_year_filing(db: Engine) -> None:
     assert count(db, "companies") == 1
     assert count(db, "filings") == 2
     assert count(db, "filing_summaries") == 6
-    assert count(db, "thesis_snapshots") == 2
+    # ADR-0014: both filings ingested with summaries pending and no thesis; a
+    # thesis composes only on a GET summary demand, which this test never makes.
+    assert count(db, "thesis_snapshots") == 0
     with db.connect() as conn:
         source_urls = (
             conn.execute(
@@ -286,7 +290,8 @@ def test_rerun_prior_year_accession_is_skipped_noop(db: Engine) -> None:
     assert second.thesis_snapshot_id is None
     assert count(db, "filings") == 2
     assert count(db, "filing_summaries") == 6
-    assert count(db, "thesis_snapshots") == 2
+    # ADR-0014: lazy thesis — no demand made, so no snapshot at ingest/skip.
+    assert count(db, "thesis_snapshots") == 0
 
 
 def test_run_with_unknown_accession_raises_filing_not_found(db: Engine) -> None:

@@ -154,7 +154,9 @@ def test_batch_rerun_skips_already_stored_via_existing_path(db: Engine) -> None:
     rerun = run_batch(service, tickers, engine=db)
     assert all(r.status == "skipped" for r in rerun.results)
     assert count(db, "filings") == 2  # nothing re-ingested
-    assert count(db, "thesis_snapshots") == 2
+    # ADR-0014: ingest (single-ticker and batch) composes no thesis — it is lazy,
+    # composed on a GET-summary demand, which this test never makes.
+    assert count(db, "thesis_snapshots") == 0
 
 
 def test_failure_mid_list_does_not_abort_and_is_categorized(db: Engine) -> None:

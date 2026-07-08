@@ -63,6 +63,19 @@ def ingest(db: Engine, tickers: list[str]) -> None:
         assert service.run(ticker).status == "ingested"
 
 
+def summarise_all(db: Engine, ticker: str) -> None:
+    """ADR-0014: the thesis is lazy — composed on the first GET-summary demand,
+    not eagerly at ingest. Drive that demand so every section is summarised and
+    the initial thesis snapshot exists, the state repair's thesis-append logic
+    depends on (it appends a repaired thesis only when every section is
+    non-pending). summarize_on_demand reads the DB and the summarizer only; the
+    edgar here is unused."""
+    service = ResearchService(
+        edgar=MultiTickerEdgar([ticker]), summarizer=FakeSummarizer(), engine=db
+    )
+    assert service.summarize_on_demand(ticker) is not None
+
+
 def filing_id_of(db: Engine, ticker: str) -> int:
     with db.connect() as conn:
         result: int = conn.execute(
@@ -181,6 +194,7 @@ def test_clean_filings_and_unaffected_sections_are_byte_untouched(db: Engine) ->
 
 def test_repair_appends_thesis_snapshot_and_latest_research_serves_it(db: Engine) -> None:
     ingest(db, ["AAA"])
+    summarise_all(db, "AAA")  # ADR-0014: lazy thesis — demand composes the initial snapshot
     corrupt(db, "AAA", "business")
     snapshots_before = table_rows(db, "thesis_snapshots")
     assert len(snapshots_before) == 1
@@ -206,6 +220,7 @@ def test_repair_appends_thesis_snapshot_and_latest_research_serves_it(db: Engine
 
 def test_second_run_is_idempotent_zero_repaired(db: Engine) -> None:
     ingest(db, ["AAA"])
+    summarise_all(db, "AAA")  # initial thesis (1); repair can then append (→2)
     corrupt(db, "AAA", "business")
     first = run_repair(RepairEdgar(), RepairSummarizer(), db)
     assert first.repaired == 1
@@ -232,7 +247,9 @@ def test_sha_mismatch_is_reported_and_skipped(db: Engine) -> None:
     assert report.results[0].reason is not None and "content_sha256" in report.results[0].reason
     assert table_rows(db, "filing_summaries") == summaries_before  # nothing written
     assert chunk_sections(db, "AAA") == {"business", "risk_factors", "mdna"}
-    assert count(db, "thesis_snapshots") == 1
+    # ADR-0014: ingest composes no thesis and no demand was made, so there is
+    # none to begin with; the skipped filing appends none either.
+    assert count(db, "thesis_snapshots") == 0
 
 
 def test_unextractable_document_with_matching_sha_fails_as_parse_error(db: Engine) -> None:
@@ -257,7 +274,9 @@ def test_unextractable_document_with_matching_sha_fails_as_parse_error(db: Engin
     assert reason is not None and "SectionExtractionError" in reason
     assert table_rows(db, "filing_summaries") == summaries_before  # nothing written
     assert chunk_sections(db, "AAA") == {"business", "risk_factors", "mdna"}
-    assert count(db, "thesis_snapshots") == 1
+    # ADR-0014: lazy thesis, no demand made — none exists and the failed filing
+    # appends none.
+    assert count(db, "thesis_snapshots") == 0
 
 
 def test_failure_mid_run_continues_and_writes_nothing_for_failed_filing(db: Engine) -> None:
@@ -277,7 +296,11 @@ def test_failure_mid_run_continues_and_writes_nothing_for_failed_filing(db: Engi
         s: summary_row(db, "AAA", s) for s in ("business", "risk_factors", "mdna")
     } == aaa_before
     assert chunk_sections(db, "AAA") == {"business", "risk_factors", "mdna"}  # not partially wiped
-    assert count(db, "thesis_snapshots") == 3  # AAA ingest + BBB ingest + BBB repair only
+    # ADR-0014: ingest composes no thesis and no demand was made; BBB's repair
+    # re-summarises only its damaged mdna while business/risk_factors stay
+    # pending, so BBB is not fully summarised and its repair appends no thesis
+    # either. AAA failed and wrote nothing. Net: zero snapshots.
+    assert count(db, "thesis_snapshots") == 0
 
 
 def test_audit_only_reports_corruption_and_writes_nothing(db: Engine) -> None:
