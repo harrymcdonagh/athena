@@ -1,6 +1,6 @@
 # 0014 — Lazy, On-Demand, Cached Filing Summarisation
 
-**Status:** Draft
+**Status:** Accepted
 
 ## Context
 
@@ -61,18 +61,32 @@ judgment layer.
 
 ## Decision
 
-1. **Summarise a filing's sections on first explicit demand, then cache;
-   ingest stops summarising.** At ingest, `ResearchService.run()` extracts each
-   section and stores its `source_text` (the retrieval substrate) exactly as it
-   does today, but makes **zero** `summarize()` calls. The three
-   `claude-sonnet-5` calls per filing are removed from the ingest path. A
-   section's `summary` is computed the first time it is explicitly demanded
-   (decision #3) and cached in place; every subsequent read is a cache hit with
-   no model call. The rejected alternative — keep eager summarisation but add a
-   cache — saves nothing, because the eager pass is exactly the spend we are
-   trying not to make.
+1. **`source_text` stays EAGER; only the `summary` answer-model call goes
+   lazy — the two split.** The `filing_summaries` row bundles two things of
+   opposite cost: `source_text` (the raw extracted section text, written with no
+   model call) and `summary` (the `claude-sonnet-5` output). `source_text` is
+   the **retrieval substrate** — `Repository.sections_pending_embedding` selects
+   it and `embeddings.run_backfill` embeds it (repository.py:198–219,
+   embeddings.py:100–114), so every FIND, COMPARE, QA, and change-detection
+   answer ultimately rests on it. **Deferring the whole row is therefore WRONG:
+   it would starve the embeddings backfill and corrupt retrieval for every
+   un-demanded filing — the exact opposite of the goal.** Ingest continues to
+   write `source_text` for all three sections eagerly and to embed it; what
+   defers is the per-section `summary` call alone. The lazy unit is the
+   `summary` field, never the row. This is the load-bearing distinction the rest
+   of the ADR builds on.
 
-2. **The cache unit is the section; the cache key is `(filing_id, section)` —
+2. **Summarise a section's `summary` on first explicit demand, then cache;
+   ingest stops summarising.** At ingest, `ResearchService.run()` extracts each
+   section and stores its `source_text` (per #1) exactly as today, but makes
+   **zero** `summarize()` calls — the three `claude-sonnet-5` calls per filing
+   leave the ingest path. A section's `summary` is computed the first time it is
+   explicitly demanded (decision #4) and cached in place; every subsequent read
+   is a cache hit with no model call. The rejected alternative — keep eager
+   summarisation but add a cache — saves nothing, because the eager pass is
+   exactly the spend we are trying not to make.
+
+3. **The cache unit is the section; the cache key is `(filing_id, section)` —
    the identity that already exists.** `filing_summaries` already carries
    `UNIQUE (filing_id, section)` (migration 0001). Per-section, not per-filing,
    is the right grain: sections are summarised independently today, repair
@@ -82,39 +96,49 @@ judgment layer.
    and `period_end_date` already encodes the period, so the sha/period identity
    the codebase relies on carries over unchanged.
 
-3. **"Demand" is an explicit request for a filing's summary — never inferred
-   from a QA/FIND/COMPARE call.** Concretely, demand is a request to the
-   summary surface (`GET /companies/{ticker}/summary`, and the
-   `POST /research/{ticker}` response if a caller asks it to return prose):
-   someone has explicitly asked to read the human-readable summary/thesis of a
-   filing. Demand is **not** a QA question, a FIND query, a COMPARE column, or a
-   change-detection run — those read `filing_chunks` and must continue to make
-   **zero** summarisation calls. This mirrors the explicit-not-inferred posture
-   of the compare flag (ADR-0009 §7: change detection is requested, never
-   inferred from question text) and the opt-in rerank flag (ADR-0013 §5): the
-   expensive path is entered by an explicit act, not guessed from a cheap one.
-   The rejected alternative — letting a QA call lazily trigger summarisation of
-   whatever filings it retrieved from — is refused: it reintroduces
-   answer-model spend into the cheap, frequent path and couples QA cost to
-   corpus size, the exact coupling this ADR removes.
+4. **Demand is a synchronous compute-on-read at the summary surface: compute
+   inline, cache, return — and it is never inferred from a QA/FIND/COMPARE
+   call.** On a request to the summary surface
+   (`GET /companies/{ticker}/summary`, and the `POST /research/{ticker}`
+   response if a caller asks it to return prose) for a section whose `summary`
+   is still pending, Athena computes that section's summary **inline within the
+   request**, writes it to the cache, and returns it in the same response: the
+   caller waits once, and every later read is a cache hit. Background/async
+   precomputation (a worker queue, a warm-the-cache job) is deliberately **out
+   of scope** — a breadth-era follow-on; at the current corpus size synchronous
+   compute-on-read is sufficient and keeps the control flow legible. Demand is
+   **not** a QA question, a FIND query, a COMPARE column, or a change-detection
+   run — those read `filing_chunks` and must continue to make **zero**
+   summarisation calls. This mirrors the explicit-not-inferred posture of the
+   compare flag (ADR-0009 §7: change detection is requested, never inferred from
+   question text) and the opt-in rerank flag (ADR-0013 §5): the expensive path
+   is entered by an explicit act, not guessed from a cheap one. The rejected
+   alternative — letting a QA call lazily trigger summarisation of whatever
+   filings it retrieved from — is refused: it reintroduces answer-model spend
+   into the cheap, frequent path and couples QA cost to corpus size, the exact
+   coupling this ADR removes.
 
-4. **A not-yet-computed summary is a first-class honest-absence state, not an
-   error and not a fabricated blank.** Between ingest and first demand, a
-   section has `source_text` (embedded, searchable) but no `summary`. This is
+5. **A pending summary is `summary IS NULL`; the schema change is a nullable
+   `summary` column, not a split table.** A not-yet-computed summary is a
+   first-class honest-absence state, not an error and not a fabricated blank —
    the same posture as the 16 known-absent filers (CLAUDE.md; honest absence
    over silent wrongness) and COMPARE's `no_finding` / `no_evidence`
    (ADR-0012 #5): the state is *reported as what it is* — "not yet summarised" —
    never a 500, never an empty string presented as if the model returned it. The
-   summary surface distinguishes "computed" from "not yet computed" explicitly.
-   On the storage side this state is `summary` absent for that `(filing_id,
-   section)`; the migration that expresses it (dropping the `summary NOT NULL`
-   constraint so the section row can exist without a summary, or an equivalent
-   split of the section row from the summary row) is deferred to implementation
-   under this ADR, per the ADR-before-migration rule — but the *contract* is
-   decided here: a section row may exist with its `source_text` and no
-   `summary`, and that is valid.
+   storage expression is: **drop the `summary NOT NULL` constraint** so a
+   `filing_summaries` row can carry its eager `source_text` with `summary` still
+   `NULL`, meaning "pending, not yet summarised." This is unambiguous **because a
+   real summary is always 300–500 words of markdown** (the summarizer's own
+   contract, `summarizer.py` `build_prompt`) and never NULL — so `summary IS
+   NULL` can only mean pending, never "the model produced nothing." The rejected
+   alternative — splitting the `source_text` row and the summary into two
+   tables — is cleaner in the abstract but buys nothing here: it duplicates the
+   `(filing_id, section)` identity, forces changes to
+   `sections_pending_embedding`, `stored_summaries`, and repair's diff, and a
+   larger migration, all to distinguish a state a single nullable column already
+   expresses without ambiguity.
 
-5. **A cached summary is valid for the exact `source_text` (and thus
+6. **A cached summary is valid for the exact `source_text` (and thus
    `content_sha256`) it was computed from; when that changes, it is
    invalidated, not silently served.** A new filing is a new `accession_number`
    → a new `filing_id` → no cached summary, so new filings are summarised on
@@ -124,22 +148,27 @@ judgment layer.
    fresh extract differs from the stored `source_text` is "damaged," and repair
    already re-summarises exactly those sections. Under lazy summarisation the
    rule is unchanged in spirit — a summary computed from stale `source_text` is
-   invalid — but repair need only *invalidate* (clear) a damaged section's
-   cached summary so it recomputes on next demand, rather than eagerly
-   re-summarising during the repair run. Either is compatible with this ADR;
-   the decided invariant is that a served summary always matches the
+   invalid — but repair need only *invalidate* (set `summary` back to `NULL`) a
+   damaged section's cached summary so it recomputes on next demand, rather than
+   eagerly re-summarising during the repair run. Either is compatible with this
+   ADR; the decided invariant is that a served summary always matches the
    `source_text`/sha it was derived from.
 
-6. **Retrieval and embeddings stay eager at ingest.** Section extraction,
-   `source_text` storage, and the Voyage embedding backfill are unchanged and
-   continue to run for every ingested filing. They are the cheap substrate that
-   keeps FIND, COMPARE, QA, and change detection working (ADR-0006, ADR-0007,
-   ADR-0011, ADR-0012), and none of them is an answer-model call. Making
-   retrieval lazy would break cross-company search for un-demanded companies —
-   the opposite of the goal — so it is explicitly out of scope.
+7. **Retrieval and embeddings stay eager at ingest (the #1 corollary at the
+   pipeline level).** Section extraction, `source_text` storage, and the Voyage
+   embedding backfill are unchanged and continue to run for every ingested
+   filing. They are the cheap substrate that keeps FIND, COMPARE, QA, and change
+   detection working (ADR-0006, ADR-0007, ADR-0011, ADR-0012), and none of them
+   is an answer-model call. Making retrieval lazy would break cross-company
+   search for un-demanded companies — the opposite of the goal — so it is
+   explicitly out of scope.
 
 **Out of scope** (each its own future decision, named so the silence is
 chosen):
+
+- **Async/background precomputation of summaries** — a worker queue or
+  cache-warming job; a breadth-era follow-on. This ADR does synchronous
+  compute-on-read only (decision #4).
 
 - **The FMP judgment module** — a later ADR; this increment only stops the
   ingest-summarisation bleed and touches no market data.
@@ -167,8 +196,10 @@ For the guarantees to hold, each checked structurally where possible:
   a summarizer that raises on use, proving none of them summarise.
 - **`source_text` is written eagerly for every ingested section**, so the
   embeddings backfill and all retrieval are unaffected. *Check:* the ingest
-  test asserts a section row with `source_text` exists post-ingest even though
-  `summary` does not.
+  test asserts a section row with a non-null `source_text` exists post-ingest
+  even though its `summary IS NULL` (pending). `source_text` remains `NOT NULL`
+  — the load-bearing retrieval invariant — while only `summary` becomes
+  nullable.
 - **Honest absence is observable, not silent.** The summary surface reports
   not-yet-computed distinctly from computed. *Check:* an endpoint test that a
   freshly ingested, never-demanded filing returns the explicit
@@ -224,16 +255,15 @@ For the guarantees to hold, each checked structurally where possible:
      recomposing a thesis; must tolerate a section whose summary was never
      computed (nothing to reuse — the section stays lazy) rather than assuming
      every section has a stored summary.
-- **Migration implication:** the `filing_summaries.summary NOT NULL` constraint
-  (migration 0001) encodes the eager-existence assumption and must be relaxed so
-  a section row can exist with `source_text` and no `summary` (equivalently, the
-  section/`source_text` row and the summary row could be split into two tables —
-  a cleaner separation of the eager substrate from the lazy derivative, at the
-  cost of a larger migration and updates to `sections_pending_embedding`,
-  `stored_summaries`, and repair's diff). The concrete migration is **not**
-  written here; per the ADR-before-migration rule it follows acceptance of this
-  ADR, which fixes the contract (a section may exist un-summarised) that the
-  migration must express.
+- **Migration:** migration 0005 drops the `filing_summaries.summary NOT NULL`
+  constraint (decision #5) so a section row can carry its eager `source_text`
+  with `summary IS NULL` = pending; `source_text` stays `NOT NULL`. `DROP NOT
+  NULL` relaxes a constraint and **rewrites no rows**, so the 85 filings already
+  summarised keep their `summary` text and stay non-pending — zero recompute, no
+  re-spend — and only newly-ingested filings arrive pending. The `down` restores
+  `SET NOT NULL`, which fails loudly if any pending (NULL) summary exists rather
+  than silently dropping the lazy contract — the honest outcome, mirroring
+  migration 0003's `period_end_date NOT NULL` pattern.
 - **Unchanged:** all retrieval (embeddings, pgvector, FIND, COMPARE, QA, change
   detection) and its cost; the wall and every ADR-0007 grounding/citation
   guarantee; `filing_chunks` and its HNSW index; the summarizer prompt, model,
@@ -243,10 +273,11 @@ For the guarantees to hold, each checked structurally where possible:
   existing sonnet-vs-opus split shows the tier lever is already partly pulled;
   whether summarisation should drop further is orthogonal to lazy-vs-eager and
   is flagged, not folded in.
-- **Build sequencing:** this ADR is draft-for-review only. On acceptance, the
-  first increment is the contract-relaxing migration (drop `summary NOT NULL`)
-  plus the ingest change (stop summarising) and the on-demand compute-and-cache
-  path behind the summary surface, built mocked and reviewed before any live
-  run, with the ingest-makes-zero-summarisation-calls structural test as the
-  gate. FMP, the model-tier split, and any COMPARE/change-detection change wait
-  for their own ADRs.
+- **Build sequencing:** this round lays acceptance + the migration only; the
+  migration is written but **not applied**, and no ingest/caching code lands
+  yet. The next increment (a later session) is the ingest change (stop
+  summarising) and the synchronous on-demand compute-and-cache path behind the
+  summary surface, built mocked and reviewed before any live run, with the
+  ingest-makes-zero-summarisation-calls structural test as the gate. FMP, the
+  model-tier split, async precomputation, and any COMPARE/change-detection
+  change wait for their own ADRs.
