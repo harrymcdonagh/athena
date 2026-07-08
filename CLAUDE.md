@@ -117,6 +117,15 @@ python -m apps.api.research.embeddings   # embedding backfill
   nullable; `source_text` stays NOT NULL. Live-validated against Postgres:
   migration round-trips clean (0004↔0005), the 255 existing summary rows stay
   non-pending, no duplicate-revision/multiple-heads error.
+- **Summariser tier decided — keep Sonnet 5** (ADR-0015, Accepted 2026-07-08,
+  no code change): `summarizer.py` stays `claude-sonnet-5`; QA/COMPARE stay
+  `claude-opus-4-8` (`qa.py`). Haiku 4.5 was A/B'd (COST/NVDA/LLY, all 3
+  sections, both models — evidence in `0015-summariser-model-tier-AB.md`): it
+  holds every material figure but breaks the 300–500-word / thesis-selective
+  contract (1.6–2× long, exhaustive extractions), and post-0014 the ~$0.15/
+  company-summary delta is trivial at lazy per-demand volumes. One-line
+  revertible; REOPEN on a bulk-resummarise event (deferred S&P 500 breadth run,
+  hundreds × $0.15) → re-run the A/B then.
 - **Frontend landed** (12bc1a3, 2026-07-07): `apps/web` is a Vite + React + TS
   research terminal (find / research+compare / passages) over the local API;
   backend has narrow CORS for the Vite dev origin (e4acb4f). ADR-0002 amended
